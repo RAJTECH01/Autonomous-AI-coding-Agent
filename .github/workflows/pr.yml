@@ -1,0 +1,993 @@
+###############################################################################
+# Pull request pipeline.
+#
+# Eleven required stages. Jobs run in parallel where they are independent and are
+# serialised only where a real dependency exists (image builds gate the E2E
+# stage, because E2E runs the images that were just built).
+#
+# THE GATE
+#   `required-checks` at the bottom is the single job to mark as required in
+#   branch protection. It fails if ANY mandatory job failed, was cancelled or was
+#   skipped. Marking individual jobs required is fragile: a skipped job reports
+#   "success" to GitHub, so a path filter or an early exit could wave a broken
+#   change through. See docs/CICD.md "Branch protection".
+#
+# MANDATORY vs ADVISORY
+#   Mandatory jobs must pass for the pull request to be mergeable.
+#   Advisory jobs (quality-debt, and the quarantined test run) report findings and
+#   are allowed to fail; they measure debt rather than block on it. Every advisory
+#   job says so in its own name.
+#
+# PERMISSIONS
+#   Read-only by default. Nothing in this workflow needs write access to the repo,
+#   and a pull_request build may contain untrusted code from a fork.
+###############################################################################
+
+name: Pull Request
+
+on:
+  pull_request:
+    branches: [main, master, develop]
+  # Also run on pushes to long-lived branches so main always has a known status.
+  push:
+    branches: [main, master, develop]
+  # Callable by release.yml, so a release re-runs these exact gates against the
+  # commit being released. This is what makes "never deploy code that fails
+  # mandatory checks" enforceable rather than a convention: the release workflow
+  # cannot reach its build or deploy jobs unless this workflow succeeds.
+  workflow_call:
+
+# A new push supersedes the previous run for the same ref: no point paying for a
+# build of code nobody will merge.
+concurrency:
+  group: pr-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  PYTHON_VERSION: '3.11'
+  NODE_VERSION: '20'
+  # Keep pip and npm quiet and non-interactive.
+  PIP_DISABLE_PIP_VERSION_CHECK: '1'
+  FORCE_COLOR: '1'
+
+jobs:
+  # ==========================================================================
+  # STAGE 1 - Install dependencies (and cache them for every later job)
+  # ==========================================================================
+  # A dedicated job so a dependency resolution failure is reported once, clearly,
+  # instead of appearing as an identical failure in eight other jobs.
+  dependencies:
+    name: 1. Install dependencies
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+          cache-dependency-path: backend/requirements*.txt
+
+      - name: Install backend dependencies
+        working-directory: backend
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements-dev.txt
+
+      - name: Verify the application imports
+        # Catches a broken dependency set or an import-time error immediately.
+        # app/core/config.py runs its production validator at import, so this also
+        # proves the default configuration is loadable.
+        working-directory: backend
+        run: python -c "from app.main import app; print('backend imports OK')"
+
+      - name: Verify the Celery worker loads
+        working-directory: backend
+        run: |
+          python - <<'PY'
+          from app.worker.celery_app import celery_app
+          import app.worker.tasks  # noqa: F401
+
+          tasks = sorted(t for t in celery_app.tasks if t.startswith("app.worker"))
+          assert "app.worker.tasks.run_agent_session" in tasks, tasks
+          assert "app.worker.tasks.reap_orphaned_sandboxes" in tasks, tasks
+          assert "reap-orphaned-sandboxes" in celery_app.conf.beat_schedule
+          print("worker OK:", tasks)
+          PY
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Install frontend dependencies
+        working-directory: frontend
+        # `npm ci` fails if package.json and the lockfile disagree, which is the
+        # check we want here.
+        run: npm ci --no-audit --no-fund
+
+  # ==========================================================================
+  # STAGE 2 - Formatting
+  # ==========================================================================
+  # CHANGED FILES ONLY, deliberately.
+  #
+  # ruff format currently reports 106 of 138 backend files and prettier 36
+  # frontend files as unformatted, because neither tool existed before. A
+  # repo-wide gate would fail every pull request until someone lands a ~140-file
+  # mechanical reformat, which is a change that should be made on purpose in its
+  # own commit, not forced through an unrelated review.
+  #
+  # So: every file a pull request touches must be formatted. Legacy files are
+  # normalised as they are next edited. To switch to repo-wide enforcement, run
+  # `ruff format app alembic tests` and `npm run format`, commit that alone, then
+  # replace the changed-file logic below with a plain `--check .`.
+  format:
+    name: 2. Formatting (changed files)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Need the merge base to diff against.
+          fetch-depth: 0
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+          cache-dependency-path: backend/requirements*.txt
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Install formatters
+        run: |
+          pip install "ruff==0.16.4"
+          cd frontend && npm ci --no-audit --no-fund
+
+      - name: Determine the base commit
+        id: base
+        run: |
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            echo "sha=${{ github.event.pull_request.base.sha }}" >> "$GITHUB_OUTPUT"
+          else
+            # On a push, compare against the previous commit. For the very first
+            # commit on a branch, before is all zeroes; fall back to HEAD~1.
+            before="${{ github.event.before }}"
+            if [ -z "$before" ] || [ "$before" = "0000000000000000000000000000000000000000" ]; then
+              before="$(git rev-parse HEAD~1 2>/dev/null || git rev-parse HEAD)"
+            fi
+            echo "sha=$before" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Check Python formatting on changed files
+        run: |
+          set -euo pipefail
+          # ACR filter: added, copied, renamed. Deleted files cannot be formatted.
+          mapfile -t files < <(git diff --name-only --diff-filter=ACMR \
+            "${{ steps.base.outputs.sha }}" HEAD -- 'backend/**/*.py' \
+            | grep -v '^backend/alembic/versions/' || true)
+
+          if [ ${#files[@]} -eq 0 ]; then
+            echo "No Python files changed."
+            exit 0
+          fi
+
+          printf 'Checking %d changed Python file(s):\n' "${#files[@]}"
+          printf '  %s\n' "${files[@]}"
+
+          # Paths come from git relative to the repo root; ruff reads its config
+          # from backend/pyproject.toml via --config.
+          if ! ruff format --check --config backend/pyproject.toml "${files[@]}"; then
+            echo ""
+            echo "::error::Changed Python files are not formatted. Run: cd backend && ruff format ."
+            exit 1
+          fi
+
+      - name: Check frontend formatting on changed files
+        run: |
+          set -euo pipefail
+          mapfile -t files < <(git diff --name-only --diff-filter=ACMR \
+            "${{ steps.base.outputs.sha }}" HEAD \
+            -- 'frontend/**/*.ts' 'frontend/**/*.tsx' 'frontend/**/*.css' 'frontend/**/*.json' || true)
+
+          if [ ${#files[@]} -eq 0 ]; then
+            echo "No frontend files changed."
+            exit 0
+          fi
+
+          printf 'Checking %d changed frontend file(s)\n' "${#files[@]}"
+          # prettier is installed inside frontend/, so strip the prefix and run there.
+          cd frontend
+          rel=()
+          for f in "${files[@]}"; do rel+=("${f#frontend/}"); done
+
+          if ! npx prettier --check "${rel[@]}"; then
+            echo ""
+            echo "::error::Changed frontend files are not formatted. Run: cd frontend && npm run format"
+            exit 1
+          fi
+
+  # ==========================================================================
+  # STAGE 3 - Linting
+  # ==========================================================================
+  lint:
+    name: 3. Lint
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+          cache-dependency-path: backend/requirements*.txt
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Install linters
+        run: |
+          pip install "ruff==0.16.4"
+          cd frontend && npm ci --no-audit --no-fund
+
+      - name: Ruff (backend, repo-wide, mandatory)
+        working-directory: backend
+        # The rule set in pyproject.toml is calibrated to pass on the current tree:
+        # bug-catching rules only (E4/E7/E9, pyflakes F63/F7/F82/F811, PLE,
+        # bugbear, T20). Verified clean at the time of writing.
+        run: ruff check --output-format=github app alembic tests
+
+      - name: ESLint (frontend, repo-wide, mandatory)
+        working-directory: frontend
+        # Errors fail the build; warnings (currently 6 x no-explicit-any) do not.
+        # Use `npm run lint:strict` locally to treat warnings as errors.
+        run: npm run lint
+
+  # ==========================================================================
+  # STAGE 4 - Type checking
+  # ==========================================================================
+  types:
+    name: 4. Type check
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+          cache-dependency-path: backend/requirements*.txt
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Install dependencies
+        run: |
+          cd backend && pip install -r requirements-dev.txt
+          cd ../frontend && npm ci --no-audit --no-fund
+
+      - name: mypy (backend)
+        working-directory: backend
+        # Not --strict. pyproject.toml holds a documented per-module debt baseline
+        # (10 modules, 24 errors) so every other module - including all new code -
+        # is enforced. Removing a module from that list is the ratchet.
+        run: mypy
+
+      - name: tsc (frontend)
+        working-directory: frontend
+        run: npm run typecheck
+
+  # ==========================================================================
+  # STAGE 5 - Backend unit tests
+  # ==========================================================================
+  unit-tests:
+    name: 5. Unit tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+          cache-dependency-path: backend/requirements*.txt
+
+      - name: Install dependencies
+        working-directory: backend
+        run: pip install -r requirements-dev.txt
+
+      - name: Run unit and component tests
+        working-directory: backend
+        # Marker exclusions, each for a specific reason:
+        #   docker      needs a reachable Docker daemon (covered by the E2E stage)
+        #   postgres    needs a real PostgreSQL server (covered by integration)
+        #   vuln        asserts behaviour that is deliberately NOT implemented yet;
+        #               these are expected failures documenting open findings
+        #   quarantine  29 tests that encode pre-hardening behaviour; tracked debt
+        #               listed in docs/CICD.md
+        run: |
+          pytest -v --tb=short \
+            -m "not docker and not postgres and not vuln and not quarantine" \
+            --junitxml=junit-unit.xml \
+            --cov=app --cov-report=xml --cov-report=term-missing
+
+      - name: Upload test results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: unit-test-results
+          path: |
+            backend/junit-unit.xml
+            backend/coverage.xml
+          retention-days: 14
+
+  # ==========================================================================
+  # STAGE 6 - Integration tests (real PostgreSQL and Redis)
+  # ==========================================================================
+  integration-tests:
+    name: 6. Integration tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+
+    # Real backing services rather than fakes: the point of this stage is to catch
+    # what SQLite cannot show - dialect differences, real constraints, real
+    # transaction behaviour.
+    services:
+      postgres:
+        image: postgres:15-alpine
+        env:
+          POSTGRES_DB: agent_platform_test
+          POSTGRES_USER: agent
+          POSTGRES_PASSWORD: ci-password
+        ports: ['5432:5432']
+        # Without a health check the job races the database's startup.
+        options: >-
+          --health-cmd "pg_isready -U agent -d agent_platform_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+
+      redis:
+        image: redis:7-alpine
+        ports: ['6379:6379']
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+
+    env:
+      ENVIRONMENT: test
+      POSTGRES_SERVER: localhost
+      POSTGRES_PORT: '5432'
+      POSTGRES_DB: agent_platform_test
+      POSTGRES_USER: agent
+      POSTGRES_PASSWORD: ci-password
+      REDIS_HOST: localhost
+      REDIS_PORT: '6379'
+      REDIS_DB: '0'
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+          cache-dependency-path: backend/requirements*.txt
+
+      - name: Install dependencies
+        working-directory: backend
+        run: pip install -r requirements-dev.txt
+
+      - name: Apply migrations to the real database
+        working-directory: backend
+        # This is the first place migrations meet PostgreSQL. A migration that
+        # works on SQLite but not PostgreSQL fails here, before the image build.
+        run: alembic upgrade head
+
+      - name: Run integration, database and API tests
+        working-directory: backend
+        run: |
+          pytest -v --tb=short \
+            -m "(integration or database or api) and not docker and not vuln and not quarantine" \
+            --junitxml=junit-integration.xml
+
+      - name: Verify Redis reachability for the worker
+        working-directory: backend
+        # The worker's broker is Redis; prove the URL the app builds actually
+        # connects, rather than discovering it at deploy time.
+        run: |
+          python - <<'PY'
+          import redis
+          from app.core.config import settings
+
+          client = redis.Redis.from_url(settings.REDIS_URL, socket_connect_timeout=5)
+          assert client.ping() is True
+          print("redis reachable at", settings.REDIS_URL)
+          PY
+
+      - name: Upload test results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: integration-test-results
+          path: backend/junit-integration.xml
+          retention-days: 14
+
+  # ==========================================================================
+  # STAGE 7 - Security checks
+  # ==========================================================================
+  security:
+    name: 7. Security
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # gitleaks needs history to scan commits, not just the tree.
+          fetch-depth: 0
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+          cache-dependency-path: backend/requirements*.txt
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Install security tooling
+        run: pip install "pip-audit>=2.7.0" "bandit[toml]>=1.7.8"
+
+      # --- Secret scanning ------------------------------------------------
+      - name: Scan for committed secrets (gitleaks)
+        # Runs in a container so no extra action permissions are needed. Scans the
+        # full history: a secret removed in a later commit is still leaked.
+        run: |
+          docker run --rm -v "$PWD:/repo" zricethezav/gitleaks:latest \
+            detect --source=/repo --redact --verbose --no-banner \
+            --exit-code 1
+
+      - name: Assert no .env file is committed
+        # Belt and braces alongside .gitignore. A committed .env is the single most
+        # common way these credentials leak.
+        run: |
+          if git ls-files --error-unmatch .env >/dev/null 2>&1; then
+            echo "::error::.env is tracked by git. Remove it: git rm --cached .env"
+            exit 1
+          fi
+          tracked=$(git ls-files | grep -E '(^|/)\.env($|\.)' | grep -v '\.env\.example$' || true)
+          if [ -n "$tracked" ]; then
+            echo "::error::environment files are tracked by git:"
+            echo "$tracked"
+            exit 1
+          fi
+          echo "No committed environment files."
+
+      - name: Assert no secrets are baked into Dockerfiles
+        # ARG/ENV carrying a credential ends up readable via `docker history`.
+        run: |
+          set -euo pipefail
+          hits=$(grep -rniE '^[[:space:]]*(ENV|ARG)[[:space:]]+[A-Z_]*(SECRET|PASSWORD|TOKEN|APIKEY|API_KEY)' \
+            --include=Dockerfile --include='Dockerfile.*' . || true)
+          if [ -n "$hits" ]; then
+            echo "::error::a Dockerfile declares a secret-looking ARG/ENV:"
+            echo "$hits"
+            exit 1
+          fi
+          echo "No secret-shaped build arguments in Dockerfiles."
+
+      # --- Dependency vulnerabilities -------------------------------------
+      - name: Audit Python dependencies (pip-audit)
+        working-directory: backend
+        # Accepted findings live in .pip-audit-ignore, each with a written
+        # justification and a remediation plan. Anything not listed there fails.
+        run: |
+          set -euo pipefail
+          ignores=()
+          while IFS= read -r line; do
+            case "$line" in ''|\#*) continue ;; esac
+            ignores+=( --ignore-vuln "$line" )
+          done < .pip-audit-ignore
+
+          echo "Accepted advisories: ${#ignores[@]} entr(y/ies) from .pip-audit-ignore"
+          pip-audit --requirement requirements.txt --progress-spinner off "${ignores[@]}"
+
+      - name: Audit npm dependencies
+        working-directory: frontend
+        # High and critical only. The moderate tier is dominated by advisories in
+        # build-time-only packages that cannot affect the shipped bundle, and
+        # failing on them trains people to ignore this stage.
+        run: npm audit --audit-level=high
+
+      # --- Static analysis -------------------------------------------------
+      - name: Static security analysis (bandit)
+        working-directory: backend
+        # -ll = medium severity and above. Intentional patterns are annotated with
+        # `# nosec <id>` plus a reason at the call site.
+        run: bandit -r app -ll
+
+      # --- Container image vulnerabilities ---------------------------------
+      - name: Build images for scanning
+        run: |
+          docker build --target api      -t scan/backend-api:pr  ./backend
+          docker build --target worker   -t scan/backend-worker:pr ./backend
+          docker build --target production -t scan/frontend:pr   ./frontend
+          docker build -t scan/reverse-proxy:pr ./deploy/reverse-proxy
+
+      - name: Scan images (Trivy)
+        # Fails on HIGH/CRITICAL with a known fix. --ignore-unfixed is deliberate:
+        # blocking on a base-image CVE that has no patch yet leaves no action to
+        # take, and a permanently red gate gets bypassed.
+        run: |
+          set -euo pipefail
+          for image in scan/backend-api:pr scan/backend-worker:pr scan/frontend:pr scan/reverse-proxy:pr; do
+            echo "::group::Trivy $image"
+            docker run --rm \
+              -v /var/run/docker.sock:/var/run/docker.sock \
+              -v "$HOME/.cache/trivy:/root/.cache/trivy" \
+              aquasec/trivy:latest image \
+              --severity HIGH,CRITICAL \
+              --ignore-unfixed \
+              --exit-code 1 \
+              --no-progress \
+              "$image"
+            echo "::endgroup::"
+          done
+
+      - name: Assert images do not run as root
+        # A non-root runtime is a stated requirement, so it is asserted rather
+        # than assumed. `docker inspect .Config.User` must be set and non-zero.
+        run: |
+          set -euo pipefail
+          for image in scan/backend-api:pr scan/backend-worker:pr scan/frontend:pr scan/reverse-proxy:pr; do
+            user=$(docker inspect --format '{{.Config.User}}' "$image")
+            if [ -z "$user" ] || [ "$user" = "root" ] || [ "${user%%:*}" = "0" ]; then
+              echo "::error::$image runs as root (User='$user')"
+              exit 1
+            fi
+            echo "$image runs as '$user'"
+          done
+
+  # ==========================================================================
+  # STAGE 8 - Build Docker images
+  # ==========================================================================
+  build-images:
+    name: 8. Build images
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      # One red image should not hide the state of the other three.
+      fail-fast: false
+      matrix:
+        include:
+          - name: backend-api
+            context: ./backend
+            target: api
+          - name: backend-worker
+            context: ./backend
+            target: worker
+          - name: frontend
+            context: ./frontend
+            target: production
+          - name: reverse-proxy
+            context: ./deploy/reverse-proxy
+            target: production
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Build ${{ matrix.name }}
+        uses: docker/build-push-action@v6
+        with:
+          context: ${{ matrix.context }}
+          target: ${{ matrix.target }}
+          # Never push from a pull request. Images are validated here and built
+          # for real, with provenance, only by the release workflow.
+          push: false
+          load: true
+          tags: ci/${{ matrix.name }}:${{ github.sha }}
+          # GitHub Actions layer cache, scoped per image so they do not evict
+          # each other.
+          cache-from: type=gha,scope=${{ matrix.name }}
+          cache-to: type=gha,scope=${{ matrix.name }},mode=max
+
+      - name: Report image size
+        # A jump in size usually means the multi-stage split broke and build
+        # tooling leaked into the runtime layer.
+        run: |
+          size=$(docker image inspect ci/${{ matrix.name }}:${{ github.sha }} \
+            --format '{{.Size}}')
+          printf '%s: %s MB\n' "${{ matrix.name }}" "$((size / 1024 / 1024))"
+          echo "### ${{ matrix.name }}: $((size / 1024 / 1024)) MB" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Verify the image starts and answers
+        # A built image is not a working image. The backend api target is the only
+        # one that can be verified standalone; the rest are covered by the E2E
+        # stage, which runs them together.
+        if: matrix.name == 'backend-api'
+        run: |
+          set -euo pipefail
+          # ENVIRONMENT=production exercises the hardening validator, so a config
+          # that would crash on a real deploy fails here instead.
+          docker run -d --name probe \
+            -e ENVIRONMENT=production \
+            -e SECRET_KEY=ci-only-not-a-real-secret-000000000000000000000000 \
+            -e DEBUG=false \
+            -e 'ALLOWED_ORIGINS=["http://localhost"]' \
+            -e POSTGRES_SERVER=127.0.0.1 \
+            -p 8000:8000 \
+            ci/backend-api:${{ github.sha }}
+
+          # Liveness does not touch the database, so it must answer even with no
+          # PostgreSQL present. Readiness is expected to report unhealthy here.
+          for i in $(seq 1 30); do
+            if curl -fsS http://localhost:8000/api/v1/health | grep -q '"status":"healthy"'; then
+              echo "container is live"
+              break
+            fi
+            if [ "$i" = "30" ]; then
+              echo "::error::container never became live"
+              docker logs probe
+              exit 1
+            fi
+            sleep 2
+          done
+
+          # Graceful shutdown: SIGTERM must produce a clean exit, and the lifespan
+          # hook must log that it released resources.
+          docker stop --timeout 30 probe
+          logs=$(docker logs probe 2>&1)
+          echo "$logs" | tail -20
+          echo "$logs" | grep -q 'Application shutdown complete' \
+            || { echo "::error::graceful shutdown did not complete"; exit 1; }
+          echo "graceful shutdown confirmed"
+          docker rm -f probe
+
+  # ==========================================================================
+  # STAGE 9 - Verify migrations
+  # ==========================================================================
+  migrations:
+    name: 9. Verify migrations
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    services:
+      postgres:
+        image: postgres:15-alpine
+        env:
+          POSTGRES_DB: migration_check
+          POSTGRES_USER: agent
+          POSTGRES_PASSWORD: ci-password
+        ports: ['5432:5432']
+        options: >-
+          --health-cmd "pg_isready -U agent -d migration_check"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+
+    env:
+      ENVIRONMENT: test
+      POSTGRES_SERVER: localhost
+      POSTGRES_PORT: '5432'
+      POSTGRES_DB: migration_check
+      POSTGRES_USER: agent
+      POSTGRES_PASSWORD: ci-password
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+          cache-dependency-path: backend/requirements*.txt
+
+      - name: Install dependencies
+        working-directory: backend
+        run: pip install -r requirements-dev.txt
+
+      - name: Exactly one migration head
+        working-directory: backend
+        # Two heads mean two branches of history were merged without a merge
+        # revision. `alembic upgrade head` then fails at deploy time, which is the
+        # worst possible moment to find out.
+        run: |
+          set -euo pipefail
+          heads=$(alembic heads | grep -c '(head)' || true)
+          alembic heads
+          if [ "$heads" -ne 1 ]; then
+            echo "::error::expected exactly 1 migration head, found $heads. Create a merge revision: alembic merge -m 'merge heads' <rev1> <rev2>"
+            exit 1
+          fi
+
+      - name: Upgrade from empty to head
+        working-directory: backend
+        run: alembic upgrade head
+
+      - name: Schema matches the models (no drift)
+        working-directory: backend
+        # Autogenerate against the freshly migrated database must produce an empty
+        # migration. If it does not, a model was changed without a matching
+        # migration, and the deployed code would query columns that do not exist.
+        run: |
+          set -euo pipefail
+          alembic revision --autogenerate -m "drift-check" --rev-id drift_check_tmp
+
+          generated="alembic/versions/drift_check_tmp_drift_check.py"
+          if [ ! -f "$generated" ]; then
+            generated=$(ls alembic/versions/*drift_check_tmp* alembic/versions/*drift-check* 2>/dev/null | head -1)
+          fi
+
+          # An empty autogenerate emits only `pass` in both directions.
+          if grep -qE '^\s+op\.' "$generated"; then
+            echo "::error::model/migration drift detected. The models declare schema that no migration creates:"
+            sed -n '/def upgrade/,/def downgrade/p' "$generated"
+            rm -f "$generated"
+            exit 1
+          fi
+
+          echo "No drift: autogenerate produced an empty migration."
+          rm -f "$generated"
+
+      - name: Downgrade to base and upgrade again
+        working-directory: backend
+        # Proves every migration has a working downgrade, which is what makes a
+        # rollback possible. A migration that cannot be reversed turns a bad
+        # deploy into a restore-from-backup.
+        run: |
+          set -euo pipefail
+          alembic downgrade base
+          remaining=$(psql "postgresql://agent:ci-password@localhost:5432/migration_check" \
+            -tAc "SELECT count(*) FROM information_schema.tables WHERE table_schema='public' AND table_name <> 'alembic_version'")
+          echo "tables remaining after downgrade: $remaining"
+          if [ "$remaining" -ne 0 ]; then
+            echo "::error::downgrade left $remaining table(s) behind; the downgrade path is incomplete"
+            exit 1
+          fi
+          alembic upgrade head
+          alembic current
+
+      - name: Migrations are idempotent when already at head
+        working-directory: backend
+        # The deploy runs `alembic upgrade head` every time, including when there
+        # is nothing to do. That must be a no-op, not an error.
+        run: |
+          alembic upgrade head
+          alembic current
+
+  # ==========================================================================
+  # STAGE 10 - Frontend tests
+  # ==========================================================================
+  frontend-tests:
+    name: 10. Frontend tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Install dependencies
+        working-directory: frontend
+        run: npm ci --no-audit --no-fund
+
+      - name: Run vitest with coverage
+        working-directory: frontend
+        # vitest.config.ts sets passWithNoTests: false, so deleting the suite
+        # fails the build rather than silently reporting success.
+        run: npm run test:coverage
+
+      - name: Production build
+        working-directory: frontend
+        # `tsc && vite build`. Catches anything the dev server tolerates but a
+        # production build does not.
+        run: npm run build
+
+      - name: Verify build output
+        working-directory: frontend
+        run: |
+          set -euo pipefail
+          test -f dist/index.html || { echo "::error::dist/index.html missing"; exit 1; }
+          # The SPA is useless without its bundle; an empty assets dir means the
+          # build silently produced nothing.
+          count=$(find dist/assets -type f | wc -l)
+          [ "$count" -gt 0 ] || { echo "::error::dist/assets is empty"; exit 1; }
+          echo "build output OK ($count asset files)"
+          du -sh dist
+
+      - name: Upload coverage
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: frontend-coverage
+          path: frontend/coverage
+          retention-days: 14
+
+  # ==========================================================================
+  # STAGE 11 - End-to-end tests
+  # ==========================================================================
+  # Boots the whole stack from the PRODUCTION image targets and drives it over
+  # HTTP through the reverse proxy. This is where the deployment architecture
+  # itself is tested: service wiring, the migration gate, health checks, network
+  # segmentation, non-root users and graceful shutdown.
+  #
+  # Runs after build-images so a plain build failure is reported by that stage
+  # rather than as a confusing stack-startup error here.
+  e2e:
+    name: 11. End-to-end (full stack)
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    needs: [build-images]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Pre-pull the sandbox runtime image
+        # The sandbox adapter pulls python:3.11-slim on the Docker host the first
+        # time a sandbox starts. Doing it up front keeps that latency out of the
+        # request path and makes a pull failure a distinct, readable error.
+        run: docker pull python:3.11-slim
+
+      - name: Run the smoke test
+        # Same script an operator runs locally. It builds the production targets,
+        # waits for health, runs deploy/scripts/health_check.sh, checks the Celery
+        # worker over the broker, and asserts no container runs as root.
+        run: bash deploy/scripts/smoke_test.sh
+
+      - name: Backend API-level end-to-end tests
+        # Complements the HTTP smoke test with the in-process e2e suite. The
+        # session-flow module is quarantined (it predates authentication), so this
+        # currently exercises the remaining e2e-marked tests.
+        working-directory: backend
+        run: |
+          pip install -r requirements-dev.txt
+          pytest -v --tb=short -m "e2e and not quarantine and not docker and not vuln" \
+            --junitxml=junit-e2e.xml
+        env:
+          ENVIRONMENT: test
+
+      - name: Upload e2e results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: e2e-test-results
+          path: backend/junit-e2e.xml
+          retention-days: 14
+
+  # ==========================================================================
+  # ADVISORY - quality debt, never blocks a merge
+  # ==========================================================================
+  # Measures the debt the mandatory gates deliberately exclude, so it stays
+  # visible and shrinking instead of being quietly forgotten.
+  quality-debt:
+    name: 'Advisory: quality debt (non-blocking)'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+          cache-dependency-path: backend/requirements*.txt
+
+      - name: Install dependencies
+        working-directory: backend
+        run: pip install -r requirements-dev.txt
+
+      - name: Repo-wide formatting debt
+        working-directory: backend
+        run: |
+          echo "## Formatting debt" >> "$GITHUB_STEP_SUMMARY"
+          ruff format --check app alembic tests 2>&1 | tail -3 >> "$GITHUB_STEP_SUMMARY" || true
+
+      - name: Extended lint rules not yet enforced
+        working-directory: backend
+        # ASYNC230 is the one worth prioritising: blocking open() inside async
+        # functions in the sandbox adapter stalls the event loop for all requests.
+        run: |
+          echo "## Extended lint findings" >> "$GITHUB_STEP_SUMMARY"
+          ruff check --statistics \
+            --extend-select I,F401,UP,SIM,RUF,C4,PIE,ASYNC,BLE \
+            app alembic tests 2>&1 | tail -30 >> "$GITHUB_STEP_SUMMARY" || true
+
+      - name: Quarantined and open-finding tests
+        working-directory: backend
+        # These are expected to fail. Running them keeps the count honest and
+        # surfaces the day one of them starts passing and can be un-quarantined.
+        run: |
+          echo "## Quarantined tests (expected to fail)" >> "$GITHUB_STEP_SUMMARY"
+          pytest -q -m "quarantine" --no-header 2>&1 | tail -5 >> "$GITHUB_STEP_SUMMARY" || true
+          echo "## Open-finding (vuln) tests" >> "$GITHUB_STEP_SUMMARY"
+          pytest -q -m "vuln" --no-header 2>&1 | tail -5 >> "$GITHUB_STEP_SUMMARY" || true
+
+  # ==========================================================================
+  # THE GATE - the single required status check
+  # ==========================================================================
+  required-checks:
+    name: All required checks
+    runs-on: ubuntu-latest
+    if: always()
+    needs:
+      - dependencies
+      - format
+      - lint
+      - types
+      - unit-tests
+      - integration-tests
+      - security
+      - build-images
+      - migrations
+      - frontend-tests
+      - e2e
+    steps:
+      - name: Verify every mandatory job succeeded
+        # `needs.*.result` is checked explicitly because a skipped or cancelled job
+        # does not fail a dependent job by default. Without this, a job skipped by
+        # a path filter or cancelled mid-run would let a merge through.
+        run: |
+          set -euo pipefail
+          declare -A results=(
+            [dependencies]="${{ needs.dependencies.result }}"
+            [format]="${{ needs.format.result }}"
+            [lint]="${{ needs.lint.result }}"
+            [types]="${{ needs.types.result }}"
+            [unit-tests]="${{ needs.unit-tests.result }}"
+            [integration-tests]="${{ needs.integration-tests.result }}"
+            [security]="${{ needs.security.result }}"
+            [build-images]="${{ needs.build-images.result }}"
+            [migrations]="${{ needs.migrations.result }}"
+            [frontend-tests]="${{ needs.frontend-tests.result }}"
+            [e2e]="${{ needs.e2e.result }}"
+          )
+
+          failed=0
+          printf '%-22s %s\n' "STAGE" "RESULT"
+          for stage in "${!results[@]}"; do
+            printf '%-22s %s\n' "$stage" "${results[$stage]}"
+            if [ "${results[$stage]}" != "success" ]; then
+              failed=1
+            fi
+          done
+
+          echo ""
+          if [ "$failed" -ne 0 ]; then
+            echo "::error::One or more mandatory checks did not succeed. This change must not be merged or deployed."
+            exit 1
+          fi
+          echo "All mandatory checks passed."

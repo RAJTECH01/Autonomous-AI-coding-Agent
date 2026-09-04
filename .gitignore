@@ -1,0 +1,64 @@
+### Secrets ###########################################################
+# Never commit real configuration values. Only .env.example is tracked.
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.crt
+*.p12
+*.pfx
+secrets/
+deploy/secrets/
+deploy/reverse-proxy/certs/*
+!deploy/reverse-proxy/certs/.gitkeep
+
+### Python ############################################################
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+.venv/
+venv/
+env/
+ENV/
+*.egg-info/
+.eggs/
+build/
+dist/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+coverage.xml
+htmlcov/
+
+### Node / frontend ###################################################
+node_modules/
+frontend/dist/
+frontend/.vite/
+npm-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+.eslintcache
+
+### Runtime data (local volumes, backups, sandbox workspaces) #########
+.data/
+backups/
+*.dump
+*.sql.gz
+
+### Logs ##############################################################
+logs/
+*.log
+
+### Editor / OS #######################################################
+.vscode/*
+!.vscode/extensions.json
+.idea/
+*.swp
+.DS_Store
+Thumbs.db
+desktop.ini

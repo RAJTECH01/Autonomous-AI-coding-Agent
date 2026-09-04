@@ -1,0 +1,94 @@
+# Edge server - TLS termination. PRODUCTION.
+#
+# Selected by setting NGINX_ENVSUBST_TEMPLATE_DIR=/etc/nginx/templates/tls.
+#
+# Certificates are mounted read-only at /etc/nginx/certs and are NEVER baked into
+# the image:
+#   /etc/nginx/certs/fullchain.pem
+#   /etc/nginx/certs/privkey.pem
+# nginx will refuse to start if they are absent, which is the correct failure
+# mode - better a container that will not boot than one silently serving plaintext.
+
+# --- Port 8080: redirect everything to HTTPS ---------------------------------
+server {
+    listen      8080;
+    listen      [::]:8080;
+    server_name ${PUBLIC_HOSTNAME} _;
+
+    # ACME HTTP-01 challenge must stay on plaintext for certificate renewal.
+    location ^~ /.well-known/acme-challenge/ {
+        root /var/www/certbot;
+        access_log off;
+    }
+
+    # Load-balancer health probes should not be answered with a 301.
+    location = /healthz {
+        access_log off;
+        add_header Content-Type text/plain always;
+        return 200 "ok\n";
+    }
+
+    location / {
+        return 301 https://$host$request_uri;
+    }
+}
+
+# --- Port 8443: the real service ---------------------------------------------
+server {
+    listen      8443 ssl;
+    listen      [::]:8443 ssl;
+    http2       on;
+    server_name ${PUBLIC_HOSTNAME};
+
+    ssl_certificate     /etc/nginx/certs/fullchain.pem;
+    ssl_certificate_key /etc/nginx/certs/privkey.pem;
+
+    # TLS 1.2 as the floor. TLS 1.0/1.1 are deprecated and fail PCI review.
+    ssl_protocols             TLSv1.2 TLSv1.3;
+    ssl_ciphers               ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256:ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384:ECDHE-ECDSA-CHACHA20-POLY1305:ECDHE-RSA-CHACHA20-POLY1305;
+    ssl_prefer_server_ciphers off;
+    ssl_session_cache         shared:SSL:10m;
+    ssl_session_timeout       1d;
+    ssl_session_tickets       off;
+
+    # OCSP stapling needs a resolver reachable from the container. Enable with
+    # the platform's DNS address, and supply the issuer chain.
+    # ssl_stapling on;
+    # ssl_stapling_verify on;
+    # ssl_trusted_certificate /etc/nginx/certs/chain.pem;
+    # resolver 127.0.0.11 valid=300s ipv6=off;
+
+    # --- Security headers ----------------------------------------------------
+    # `always` so they are attached to error responses too, not just 2xx.
+    add_header Strict-Transport-Security "max-age=31536000; includeSubDomains" always;
+    add_header X-Content-Type-Options    nosniff always;
+    add_header X-Frame-Options           DENY always;
+    add_header Referrer-Policy           strict-origin-when-cross-origin always;
+    add_header Permissions-Policy        "camera=(), microphone=(), geolocation=(), payment=()" always;
+    add_header Cross-Origin-Opener-Policy same-origin always;
+
+    # CSP notes:
+    #   'unsafe-inline' in style-src is required because the React components set
+    #   style={{...}} attributes throughout SessionWorkspace.tsx. Removing it
+    #   means moving those to CSS classes first.
+    #   script-src has no 'unsafe-inline': Vite emits external bundles only.
+    #   connect-src 'self' is sufficient because the API is same-origin via /api.
+    add_header Content-Security-Policy "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; font-src 'self' data:; connect-src 'self'; frame-ancestors 'none'; base-uri 'self'; form-action 'self'; object-src 'none'" always;
+
+    # --- Interactive API docs: not public ------------------------------------
+    # FastAPI serves /api/v1/docs and /api/v1/openapi.json unconditionally -
+    # app/main.py sets docs_url and openapi_url with no environment check - so
+    # the whole API surface is otherwise browsable by anyone. Blocked here rather
+    # than left to the application.
+    location ~ ^/api/v1/(docs|redoc|openapi\.json) {
+        allow 10.0.0.0/8;
+        allow 172.16.0.0/12;
+        allow 192.168.0.0/16;
+        deny  all;
+
+        include /etc/nginx/snippets/proxy-common.conf;
+        proxy_pass http://backend_api;
+    }
+
+    include /etc/nginx/snippets/app-routes.conf;
+}

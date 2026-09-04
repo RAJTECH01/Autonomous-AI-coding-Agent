@@ -1,0 +1,320 @@
+###############################################################################
+# LOCAL DEVELOPMENT stack.
+#
+#   docker compose up --build
+#   open http://localhost:8080          (through the reverse proxy)
+#
+# Production lives in deploy/compose.prod.yml. Do not deploy this file: it uses
+# weak credentials, publishes database ports to the host, enables DEBUG, and
+# bind-mounts source code over the image.
+#
+# It intentionally works with NO .env file so a fresh clone starts in one
+# command. Only the AI provider keys are read from the environment, and the
+# stack boots without them (sessions fail at request time, everything else
+# works).
+#
+# Service map
+#   reverse-proxy    :8080  ->  frontend / backend        (the only entry point)
+#   frontend         :5173  Vite dev server with HMR
+#   backend          :8000  FastAPI with --reload
+#   worker                  Celery worker + embedded beat
+#   sandbox-broker          filtered Docker API for sandbox containers
+#   postgres         :5432  published for local psql/GUI access
+#   redis            :6379  published for local redis-cli access
+#   migrate                 one-shot `alembic upgrade head`, then exits
+###############################################################################
+
+x-dev-logging: &dev-logging
+  # Cap log growth even locally: an agent loop is chatty and an unbounded
+  # json-file will fill a laptop disk.
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "3"
+
+# Settings shared by every container that runs the backend image.
+x-backend-env: &backend-env
+  ENVIRONMENT: development
+  DEBUG: "true"
+  # Dev default is fine here precisely because ENVIRONMENT=development: the
+  # production validator in app/core/config.py only rejects it outside
+  # {development, test, local}.
+  SECRET_KEY: dev-secret-key-change-in-production-1234567890
+  ALLOWED_ORIGINS: '["http://localhost:8080","http://localhost:5173","http://127.0.0.1:5173"]'
+
+  POSTGRES_SERVER: postgres
+  POSTGRES_PORT: "5432"
+  POSTGRES_DB: agent_platform
+  POSTGRES_USER: agent
+  POSTGRES_PASSWORD: devpassword
+
+  REDIS_HOST: redis
+  REDIS_PORT: "6379"
+  REDIS_DB: "0"
+
+  # Passed through from your shell if set; the stack starts either way.
+  ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+  OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+  GEMINI_API_KEY: ${GEMINI_API_KEY:-}
+
+  # Sandboxing goes through the broker, never the raw host socket.
+  DOCKER_HOST: tcp://sandbox-broker:2375
+  # Host execution stays off even in development. Turning it on runs
+  # model-generated shell commands directly in this container.
+  SANDBOX_ALLOW_HOST_FALLBACK: "false"
+  # tempfile.gettempdir() reads TMPDIR, and that is where the sandbox adapter
+  # creates each workspace.
+  TMPDIR: /srv/agent/sandboxes
+
+  ALEMBIC_UPGRADE_ON_START: "0"
+
+services:
+  # ==========================================================================
+  # PostgreSQL
+  # ==========================================================================
+  postgres:
+    image: postgres:15-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: agent_platform
+      POSTGRES_USER: agent
+      POSTGRES_PASSWORD: devpassword
+      # Speeds up initdb and keeps collation stable across machines.
+      POSTGRES_INITDB_ARGS: "--encoding=UTF8 --locale=C"
+    ports:
+      # Published for local tooling only. Never do this in production.
+      - "127.0.0.1:5432:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      # -d and -U are required: without them pg_isready checks the wrong
+      # database and reports ready before the app's database exists.
+      test: ["CMD-SHELL", "pg_isready -U agent -d agent_platform"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+    logging: *dev-logging
+
+  # ==========================================================================
+  # Redis - Celery broker
+  # ==========================================================================
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    command: ["redis-server", "/usr/local/etc/redis/redis.conf"]
+    ports:
+      - "127.0.0.1:6379:6379"
+    volumes:
+      - ./deploy/redis/redis.conf:/usr/local/etc/redis/redis.conf:ro
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    logging: *dev-logging
+
+  # ==========================================================================
+  # Sandbox execution service - filtered Docker API
+  # ==========================================================================
+  # The sandbox adapter is an in-process library that drives the Docker daemon
+  # (docker.from_env(), controlled by DOCKER_HOST). Rather than mounting the host
+  # socket into the backend - which is equivalent to handing the API process root
+  # on the host - the socket is mounted only here, behind a proxy that permits
+  # just the calls the adapter needs.
+  #
+  # This narrows the blast radius; it does not eliminate it. Container create
+  # plus bind mounts is still a privilege-escalation path. See
+  # docs/DEPLOYMENT.md "Sandbox execution service" for what a genuinely isolated
+  # deployment requires.
+  sandbox-broker:
+    image: tecnativa/docker-socket-proxy:0.2.0
+    restart: unless-stopped
+    environment:
+      # Everything not listed defaults to 0 (denied).
+      CONTAINERS: "1"   # inspect/list/create/remove sandbox containers
+      POST: "1"         # required: without it the proxy is read-only
+      EXEC: "1"         # container.exec_run - how commands reach the sandbox
+      IMAGES: "1"       # pull python:3.11-slim etc. on first use
+      INFO: "1"
+      VERSION: "1"      # docker.from_env() negotiates the API version
+      PING: "1"         # client.ping() during adapter init
+      # Explicitly denied: these are the escalation primitives.
+      NETWORKS: "0"
+      VOLUMES: "0"
+      SWARM: "0"
+      SECRETS: "0"
+      CONFIGS: "0"
+      NODES: "0"
+      SERVICES: "0"
+      TASKS: "0"
+      PLUGINS: "0"
+      SYSTEM: "0"
+      BUILD: "0"
+      COMMIT: "0"
+      DISTRIBUTION: "0"
+      SESSION: "0"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:2375/_ping || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+    logging: *dev-logging
+
+  # ==========================================================================
+  # Migrations - runs once, then exits
+  # ==========================================================================
+  migrate:
+    build:
+      context: ./backend
+      target: migrate
+    environment:
+      <<: *backend-env
+      WAIT_FOR_POSTGRES: "1"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: "no"
+    logging: *dev-logging
+
+  # ==========================================================================
+  # Backend API
+  # ==========================================================================
+  backend:
+    build:
+      context: ./backend
+      target: development
+    environment:
+      <<: *backend-env
+      WAIT_FOR_POSTGRES: "1"
+      WAIT_FOR_REDIS: "1"
+    ports:
+      # Published so you can hit the API directly and read /api/v1/docs without
+      # going through the proxy.
+      - "127.0.0.1:8000:8000"
+    volumes:
+      # Source bind mount drives --reload. Named volumes shadow the host's
+      # __pycache__ and any stray .venv so Linux bytecode never mixes with
+      # Windows bytecode.
+      - ./backend:/app
+      - backend-pycache:/app/app/__pycache__
+      - sandbox-workspaces:/srv/agent/sandboxes
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+      sandbox-broker:
+        condition: service_started
+    # Gives the lifespan shutdown hook room to destroy sandboxes and dispose the
+    # connection pool before SIGKILL.
+    stop_grace_period: 30s
+    # PID 1 that reaps zombies; without it, orphaned child processes accumulate.
+    init: true
+    logging: *dev-logging
+
+  # ==========================================================================
+  # Worker - Celery consumer with embedded beat scheduler
+  # ==========================================================================
+  # -B embeds the scheduler in the worker, which is convenient locally but wrong
+  # in production: with more than one worker replica, every replica would run its
+  # own scheduler and fire the periodic reaper N times. Production runs a
+  # separate single-replica beat service.
+  worker:
+    build:
+      context: ./backend
+      target: development
+    command:
+      - celery
+      - -A
+      - app.worker.celery_app:celery_app
+      - worker
+      - --loglevel=info
+      - --concurrency=2
+      - -B
+      - --schedule=/tmp/celerybeat-schedule
+    environment:
+      <<: *backend-env
+      WAIT_FOR_REDIS: "1"
+    volumes:
+      - ./backend:/app
+      - sandbox-workspaces:/srv/agent/sandboxes
+    depends_on:
+      redis:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+      sandbox-broker:
+        condition: service_started
+    # Celery's warm shutdown waits for the running task; an agent run is long.
+    stop_grace_period: 120s
+    init: true
+    logging: *dev-logging
+
+  # ==========================================================================
+  # Frontend - Vite dev server
+  # ==========================================================================
+  frontend:
+    build:
+      context: ./frontend
+      target: development
+    environment:
+      # Inside this container 'localhost' is the frontend itself, so the dev
+      # proxy has to name the backend service.
+      VITE_PROXY_TARGET: http://backend:8000
+    ports:
+      - "127.0.0.1:5173:5173"
+    volumes:
+      # node_modules stays in the image: the host tree is Windows-built and its
+      # native binaries do not run on Alpine.
+      - ./frontend:/app
+      - /app/node_modules
+    depends_on:
+      backend:
+        condition: service_started
+    logging: *dev-logging
+
+  # ==========================================================================
+  # Reverse proxy - single entry point
+  # ==========================================================================
+  reverse-proxy:
+    build:
+      context: ./deploy/reverse-proxy
+    environment:
+      # Plaintext template: no certificates needed locally.
+      NGINX_ENVSUBST_TEMPLATE_DIR: /etc/nginx/templates/http
+      PUBLIC_HOSTNAME: localhost
+    ports:
+      - "8080:8080"
+    depends_on:
+      backend:
+        condition: service_started
+      frontend:
+        condition: service_started
+    tmpfs:
+      - /tmp
+    logging: *dev-logging
+
+volumes:
+  postgres-data:
+  redis-data:
+  backend-pycache:
+  # Sandbox scratch space.
+  #
+  # LIMITATION: the adapter passes this container path as the *host* bind source
+  # when starting a sandbox container, so the Docker daemon resolves it on the
+  # host, where it is a volume path rather than this directory. Files written
+  # through write_file therefore are not visible inside the sandbox container.
+  # Production fixes this by bind-mounting a host directory at the identical
+  # absolute path; on Docker Desktop the paths cannot be made identical.
+  # See docs/DEPLOYMENT.md "Workspace path identity".
+  sandbox-workspaces:
+
+networks:
+  default:
+    name: agent-dev

@@ -1,0 +1,655 @@
+###############################################################################
+# PRODUCTION deployment - single host, Docker Compose.
+#
+#   cd deploy
+#   docker compose -f compose.prod.yml --env-file ../.env pull
+#   docker compose -f compose.prod.yml --env-file ../.env up -d
+#
+# READ THIS FIRST
+#   Compose is a single-host container runtime. It is NOT a complete production
+#   orchestration solution: no multi-node scheduling, no rolling deploys gated on
+#   health, no automatic rescheduling when a host dies, no horizontal autoscaling,
+#   no secret rotation. This file is appropriate for a single-node deployment or
+#   a staging environment. See docs/DEPLOYMENT.md "What Compose does not give you"
+#   before treating it as your production platform.
+#
+# THERE ARE NO `build:` BLOCKS HERE, BY DESIGN
+#   Production runs the exact images CI built, scanned and tested. Building on
+#   the production host would produce an artifact nothing has ever verified and
+#   would make the deployment non-reproducible. Every image reference is a
+#   required variable pinned to a digest, so `up -d` fails fast rather than
+#   silently resolving a mutable tag.
+#
+# Only the reverse proxy publishes ports. Postgres, Redis, the API, the worker
+# and the frontend are reachable solely on the internal networks.
+###############################################################################
+
+# --- Log management ----------------------------------------------------------
+# Bounded json-file so a crash loop cannot fill the disk and take the host down.
+# Total worst case is roughly max-size x max-file x number of containers.
+# On a real production host, forward these to a collector (Loki, CloudWatch,
+# Elastic) instead of relying on local files; the backend already emits
+# structured JSON via structlog, and the proxy emits JSON access logs.
+x-logging: &logging
+  driver: json-file
+  options:
+    max-size: "20m"
+    max-file: "5"
+    compress: "true"
+
+# --- Hardening applied to every first-party container ------------------------
+x-hardening: &hardening
+  security_opt:
+    # Blocks setuid binaries from gaining privileges, even if one is present.
+    - no-new-privileges:true
+  cap_drop:
+    # None of these processes need a single Linux capability: they bind ports
+    # above 1024 and run as non-root.
+    - ALL
+
+# --- Backend configuration ---------------------------------------------------
+# Values come from the .env file passed via --env-file. Nothing secret is
+# written here.
+x-backend-env: &backend-env
+  ENVIRONMENT: ${ENVIRONMENT:-production}
+  DEBUG: "false"
+  SECRET_KEY: ${SECRET_KEY:?SECRET_KEY must be set to a random value of at least 32 characters}
+  ALLOWED_ORIGINS: ${ALLOWED_ORIGINS:?ALLOWED_ORIGINS must be set as a JSON array, e.g. ["https://agent.example.com"]}
+  ACCESS_TOKEN_EXPIRE_MINUTES: ${ACCESS_TOKEN_EXPIRE_MINUTES:-30}
+  REFRESH_TOKEN_EXPIRE_DAYS: ${REFRESH_TOKEN_EXPIRE_DAYS:-7}
+
+  POSTGRES_SERVER: postgres
+  POSTGRES_PORT: "5432"
+  POSTGRES_DB: ${POSTGRES_DB:-agent_platform}
+  POSTGRES_USER: ${POSTGRES_USER:?POSTGRES_USER must be set}
+  POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be set}
+
+  REDIS_HOST: redis
+  REDIS_PORT: "6379"
+  REDIS_DB: "0"
+
+  DEFAULT_AI_PROVIDER: ${DEFAULT_AI_PROVIDER:-anthropic}
+  DEFAULT_MODEL_NAME: ${DEFAULT_MODEL_NAME:-claude-3-5-sonnet-20241022}
+  ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+  OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+  GEMINI_API_KEY: ${GEMINI_API_KEY:-}
+
+  # Sandbox limits. Effective host load is worker concurrency x these values.
+  SANDBOX_MAX_CPUS: ${SANDBOX_MAX_CPUS:-2.0}
+  SANDBOX_MAX_MEMORY_MB: ${SANDBOX_MAX_MEMORY_MB:-512}
+  SANDBOX_MAX_PIDS: ${SANDBOX_MAX_PIDS:-100}
+  SANDBOX_TIMEOUT_SECONDS: ${SANDBOX_TIMEOUT_SECONDS:-120}
+  SANDBOX_MAX_OUTPUT_BYTES: ${SANDBOX_MAX_OUTPUT_BYTES:-1048576}
+  # Never true in production. app/core/config.py refuses to boot if it is.
+  SANDBOX_ALLOW_HOST_FALLBACK: "false"
+
+  # All Docker access is mediated by the broker; the host socket is never mounted
+  # into an application container.
+  DOCKER_HOST: tcp://sandbox-broker:2375
+  # tempfile.gettempdir() reads TMPDIR, and the sandbox adapter creates each
+  # workspace under it. Must equal the host path bind-mounted below.
+  TMPDIR: ${SANDBOX_WORKSPACE_ROOT:-/srv/agent/sandboxes}
+
+  # Only the migrate service applies migrations.
+  ALEMBIC_UPGRADE_ON_START: "0"
+
+services:
+  # ==========================================================================
+  # Volume ownership init - one-shot, must run before postgres
+  # ==========================================================================
+  # Docker creates named volumes owned by root:root. The postgres entrypoint
+  # chowns only PGDATA, so without this:
+  #   * archive_command ("cp %p /wal-archive/%f") fails with permission denied.
+  #     PostgreSQL then retries forever and never recycles WAL segments, so
+  #     pg_wal grows until the disk fills and the database halts. The failure is
+  #     quiet until it becomes an outage.
+  #   * the backup container could not write dumps unless it ran as root.
+  #
+  # Runs as root by necessity (chown requires it), does nothing else, and exits.
+  postgres-init:
+    image: postgres:15-alpine
+    entrypoint:
+      - /bin/sh
+      - -c
+      - |
+        set -e
+        mkdir -p /wal-archive /backups
+        chown -R postgres:postgres /wal-archive /backups
+        chmod 750 /wal-archive /backups
+        echo "[postgres-init] volume ownership set for /wal-archive and /backups"
+    volumes:
+      - postgres-wal-archive:/wal-archive
+      - postgres-backups:/backups
+    networks:
+      - data
+    restart: "no"
+    logging: *logging
+
+  # ==========================================================================
+  # PostgreSQL - persistent state
+  # ==========================================================================
+  postgres:
+    image: postgres:15-alpine
+    restart: unless-stopped
+    depends_on:
+      postgres-init:
+        condition: service_completed_successfully
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-agent_platform}
+      POSTGRES_USER: ${POSTGRES_USER:?POSTGRES_USER must be set}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be set}
+      POSTGRES_INITDB_ARGS: "--encoding=UTF8 --locale=C --data-checksums"
+      # Keeps pg_dump/psql from prompting inside the backup container.
+      PGDATA: /var/lib/postgresql/data/pgdata
+    command:
+      # Tuned conservatively for a 2 GiB container. Recalculate for your host:
+      # shared_buffers ~25% of container memory, effective_cache_size ~50-75%.
+      - postgres
+      - -c
+      - shared_buffers=512MB
+      - -c
+      - effective_cache_size=1536MB
+      - -c
+      - work_mem=16MB
+      - -c
+      - maintenance_work_mem=128MB
+      # max_connections must cover every client: the API pool is pool_size=20 +
+      # max_overflow=10 = 30 per process, plus the worker's pool, plus beat,
+      # migrate and backups. 100 leaves headroom; raising the API replica count
+      # requires raising this too.
+      - -c
+      - max_connections=100
+      # --- Write-ahead logging: the foundation of point-in-time recovery ------
+      # replica level + archiving is what makes recovery to an arbitrary moment
+      # possible. Without it, the only restore point is the last pg_dump, so the
+      # RPO equals the backup interval (24h by default). See
+      # docs/DEPLOYMENT.md "Database recovery strategy".
+      - -c
+      - wal_level=replica
+      - -c
+      - archive_mode=on
+      # Copies each completed WAL segment into the archive volume. Replace with a
+      # command that ships to object storage (wal-g, pgBackRest) for offsite DR:
+      # a local archive dies with the host.
+      - -c
+      - archive_command=test ! -f /wal-archive/%f && cp %p /wal-archive/%f
+      - -c
+      - archive_timeout=300
+      - -c
+      - max_wal_size=2GB
+      - -c
+      - min_wal_size=128MB
+      # --- Observability -----------------------------------------------------
+      - -c
+      - log_min_duration_statement=1000
+      - -c
+      - log_checkpoints=on
+      - -c
+      - log_connections=on
+      - -c
+      - log_disconnections=on
+      - -c
+      - log_lock_waits=on
+      - -c
+      - log_destination=stderr
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+      - postgres-wal-archive:/wal-archive
+    networks:
+      # Deliberately not on the edge network: the proxy has no business reaching
+      # the database.
+      - data
+    # NO `ports:` mapping. The database must never be reachable from outside the
+    # host. Use `docker compose exec postgres psql` or an SSH tunnel.
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB:-agent_platform}"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 30s
+    # A checkpoint on shutdown can take a while; killing mid-checkpoint forces
+    # crash recovery on the next start.
+    stop_grace_period: 60s
+    # NOTE: no `cap_drop: ALL` here, unlike the application containers. The
+    # postgres entrypoint starts as root to fix data-directory ownership and then
+    # drops to the postgres user, which needs CAP_CHOWN, CAP_SETUID and
+    # CAP_SETGID to do so. Dropping all capabilities breaks startup.
+    security_opt:
+      - no-new-privileges:true
+    deploy:
+      resources:
+        limits:
+          cpus: "2.0"
+          memory: 2G
+        reservations:
+          # Guarantees the database is not starved by the agent workload.
+          cpus: "0.5"
+          memory: 1G
+    logging: *logging
+
+  # ==========================================================================
+  # Redis - Celery broker and result backend
+  # ==========================================================================
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    command: ["redis-server", "/usr/local/etc/redis/redis.conf"]
+    volumes:
+      - ./redis/redis.conf:/usr/local/etc/redis/redis.conf:ro
+      # Persistent: this volume holds the AOF and RDB files. Queued agent runs
+      # live here, so losing it loses work.
+      - redis-data:/data
+    networks:
+      - data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 10s
+    # Long enough for a final AOF fsync and RDB write on SIGTERM.
+    stop_grace_period: 30s
+    <<: *hardening
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          # Must exceed the 384mb maxmemory in redis.conf: an AOF rewrite or
+          # BGSAVE transiently doubles resident memory through copy-on-write.
+          memory: 768M
+        reservations:
+          memory: 256M
+    logging: *logging
+
+  # ==========================================================================
+  # Sandbox execution service - mediated Docker API
+  # ==========================================================================
+  # The only container that touches the host Docker socket. Application
+  # containers reach it over TCP and can therefore issue only the calls
+  # allowlisted below.
+  #
+  # HONEST LIMITATION: CONTAINERS + POST + EXEC is still a powerful grant. An
+  # attacker with code execution inside the backend or worker can use this
+  # endpoint to start a container that bind-mounts the host filesystem and thus
+  # escape to the host. The proxy raises the bar and gives an audit point; it is
+  # not a security boundary equivalent to real isolation. A hardened deployment
+  # runs sandboxes on a dedicated, disposable host (or rootless/VM isolation such
+  # as gVisor, Kata or Firecracker). docs/DEPLOYMENT.md "Residual risks".
+  sandbox-broker:
+    image: tecnativa/docker-socket-proxy:0.2.0
+    restart: unless-stopped
+    environment:
+      CONTAINERS: "1"
+      POST: "1"
+      EXEC: "1"
+      IMAGES: "1"
+      INFO: "1"
+      VERSION: "1"
+      PING: "1"
+      NETWORKS: "0"
+      VOLUMES: "0"
+      SWARM: "0"
+      SECRETS: "0"
+      CONFIGS: "0"
+      NODES: "0"
+      SERVICES: "0"
+      TASKS: "0"
+      PLUGINS: "0"
+      SYSTEM: "0"
+      BUILD: "0"
+      COMMIT: "0"
+      DISTRIBUTION: "0"
+      SESSION: "0"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    networks:
+      # Only the sandbox network. The proxy and database cannot reach it.
+      - sandbox
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:2375/_ping || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+    deploy:
+      resources:
+        limits:
+          cpus: "0.5"
+          memory: 128M
+    logging: *logging
+
+  # ==========================================================================
+  # Migrations - one-shot, gates the API rollout
+  # ==========================================================================
+  # Reuses the API image with an explicit command instead of a separate migrate
+  # image, so the schema is applied by exactly the build that will serve traffic.
+  # A dedicated image could drift from it.
+  #
+  # Exits 0 on success. `depends_on: service_completed_successfully` on the API
+  # means a failed migration stops the rollout instead of starting code against
+  # the wrong schema.
+  migrate:
+    image: ${BACKEND_API_IMAGE:?BACKEND_API_IMAGE must be a digest-pinned reference, e.g. ghcr.io/org/agent-backend-api@sha256:...}
+    command: ["alembic", "upgrade", "head"]
+    environment:
+      <<: *backend-env
+      WAIT_FOR_POSTGRES: "1"
+      WAIT_TIMEOUT: "120"
+      ALEMBIC_UPGRADE_ON_START: "0"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+      - data
+    restart: "no"
+    read_only: true
+    tmpfs:
+      - /tmp:size=64m
+    <<: *hardening
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 512M
+    logging: *logging
+
+  # ==========================================================================
+  # Backend API
+  # ==========================================================================
+  backend:
+    image: ${BACKEND_API_IMAGE:?BACKEND_API_IMAGE must be a digest-pinned reference}
+    restart: unless-stopped
+    environment:
+      <<: *backend-env
+      WAIT_FOR_POSTGRES: "1"
+      WAIT_FOR_REDIS: "1"
+      # Must stay below stop_grace_period so shutdown finishes before SIGKILL.
+      GRACEFUL_TIMEOUT: "30"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+      sandbox-broker:
+        condition: service_healthy
+    networks:
+      # edge: reachable by the reverse proxy. data: reaches Postgres and Redis.
+      # sandbox: reaches the broker.
+      - edge
+      - data
+      - sandbox
+    volumes:
+      # Host path identity: the container path and the host path are the same
+      # string, because the sandbox adapter hands this path to the Docker daemon
+      # as a bind source. If they differ, the daemon creates an empty directory
+      # on the host and the sandbox sees none of the agent's files.
+      - ${SANDBOX_WORKSPACE_ROOT:-/srv/agent/sandboxes}:${SANDBOX_WORKSPACE_ROOT:-/srv/agent/sandboxes}
+    # NO `ports:`. Traffic arrives only via the reverse proxy.
+    read_only: true
+    tmpfs:
+      - /tmp:size=256m
+    # Exceeds GRACEFUL_TIMEOUT so uvicorn's graceful shutdown, sandbox teardown
+    # and pool disposal complete before the container is killed.
+    stop_grace_period: 45s
+    init: true
+    <<: *hardening
+    deploy:
+      # PINNED AT 1 - a correctness constraint, not a capacity choice.
+      # Agent sessions (SESSIONS_DB/STATE_MACHINES_DB), the rate limiter and the
+      # brute-force counters are per-process dicts. A second replica gets its own
+      # copies, so a session created on one replica 404s on the other. Scaling
+      # out requires moving that state to Redis or Postgres first.
+      # docs/DEPLOYMENT.md "Scaling constraints".
+      replicas: 1
+      resources:
+        limits:
+          cpus: "2.0"
+          memory: 2G
+        reservations:
+          cpus: "0.5"
+          memory: 512M
+    logging: *logging
+
+  # ==========================================================================
+  # Worker - Celery consumer
+  # ==========================================================================
+  worker:
+    image: ${BACKEND_WORKER_IMAGE:?BACKEND_WORKER_IMAGE must be a digest-pinned reference}
+    restart: unless-stopped
+    environment:
+      <<: *backend-env
+      WAIT_FOR_REDIS: "1"
+      WAIT_FOR_POSTGRES: "1"
+      CELERY_CONCURRENCY: ${CELERY_CONCURRENCY:-2}
+      CELERY_LOGLEVEL: ${CELERY_LOGLEVEL:-info}
+    depends_on:
+      redis:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+      sandbox-broker:
+        condition: service_healthy
+    networks:
+      - data
+      - sandbox
+    volumes:
+      # Same host path identity requirement as the API.
+      - ${SANDBOX_WORKSPACE_ROOT:-/srv/agent/sandboxes}:${SANDBOX_WORKSPACE_ROOT:-/srv/agent/sandboxes}
+    read_only: true
+    tmpfs:
+      - /tmp:size=256m
+    # Celery's warm shutdown finishes the task in flight. An agent run can take
+    # tens of minutes, so this is the ceiling on how long a deploy waits before
+    # killing work. Raise it if you would rather wait than lose a run.
+    stop_grace_period: 300s
+    init: true
+    <<: *hardening
+    deploy:
+      # Safe to scale: each worker pulls independent tasks from Redis. Remember
+      # each concurrent task also starts a sandbox container, so host load is
+      # replicas x CELERY_CONCURRENCY x SANDBOX_MAX_CPUS.
+      replicas: ${WORKER_REPLICAS:-1}
+      resources:
+        limits:
+          cpus: "2.0"
+          memory: 2G
+        reservations:
+          cpus: "0.5"
+          memory: 512M
+    logging: *logging
+
+  # ==========================================================================
+  # Beat - periodic task scheduler (worker tier)
+  # ==========================================================================
+  # Separate from the worker because beat must be a singleton. Embedding it with
+  # `celery worker -B` (as the dev stack does) would make every worker replica
+  # run its own scheduler and fire the sandbox reaper once per replica.
+  beat:
+    image: ${BACKEND_WORKER_IMAGE:?BACKEND_WORKER_IMAGE must be a digest-pinned reference}
+    restart: unless-stopped
+    command:
+      - celery
+      - -A
+      - app.worker.celery_app:celery_app
+      - beat
+      - --loglevel=info
+      # Schedule state on tmpfs: it is a cache of "when did this last run", and
+      # a rebuilt schedule after restart is harmless.
+      - --schedule=/tmp/celerybeat-schedule
+    environment:
+      <<: *backend-env
+      WAIT_FOR_REDIS: "1"
+    depends_on:
+      redis:
+        condition: service_healthy
+    networks:
+      - data
+    read_only: true
+    tmpfs:
+      - /tmp:size=64m
+    stop_grace_period: 30s
+    init: true
+    <<: *hardening
+    deploy:
+      replicas: 1
+      resources:
+        limits:
+          cpus: "0.5"
+          memory: 256M
+    logging: *logging
+
+  # ==========================================================================
+  # Frontend - static assets
+  # ==========================================================================
+  frontend:
+    image: ${FRONTEND_IMAGE:?FRONTEND_IMAGE must be a digest-pinned reference}
+    restart: unless-stopped
+    networks:
+      - edge
+    read_only: true
+    tmpfs:
+      # nginx-unprivileged writes its pid and proxy/client temp files here.
+      - /tmp:size=32m
+      - /var/cache/nginx:size=32m
+    stop_grace_period: 15s
+    <<: *hardening
+    deploy:
+      # Stateless: safe to scale horizontally behind the proxy.
+      replicas: ${FRONTEND_REPLICAS:-1}
+      resources:
+        limits:
+          cpus: "0.5"
+          memory: 128M
+        reservations:
+          memory: 32M
+    logging: *logging
+
+  # ==========================================================================
+  # Reverse proxy - TLS termination, the only public entry point
+  # ==========================================================================
+  reverse-proxy:
+    image: ${REVERSE_PROXY_IMAGE:?REVERSE_PROXY_IMAGE must be a digest-pinned reference}
+    restart: unless-stopped
+    environment:
+      NGINX_ENVSUBST_TEMPLATE_DIR: /etc/nginx/templates/tls
+      PUBLIC_HOSTNAME: ${PUBLIC_HOSTNAME:?PUBLIC_HOSTNAME must be set, e.g. agent.example.com}
+    ports:
+      # Host 80/443 -> container 8080/8443. nginx runs unprivileged and cannot
+      # bind ports below 1024 itself.
+      - "${HTTP_PORT:-80}:8080"
+      - "${HTTPS_PORT:-443}:8443"
+    volumes:
+      # Certificates are secrets: mounted read-only at run time, never baked into
+      # the image and never committed.
+      - ./reverse-proxy/certs:/etc/nginx/certs:ro
+      # Shared with a certbot renewal job writing ACME HTTP-01 challenges.
+      - certbot-webroot:/var/www/certbot
+    networks:
+      # edge only. The proxy cannot reach Postgres, Redis or the Docker broker,
+      # so a proxy compromise does not reach the data tier.
+      - edge
+    depends_on:
+      backend:
+        condition: service_healthy
+      frontend:
+        condition: service_started
+    read_only: true
+    tmpfs:
+      - /tmp:size=64m
+    # SIGQUIT is nginx's graceful shutdown: finish in-flight requests, then exit.
+    # SIGTERM would be a fast shutdown that drops them.
+    stop_signal: SIGQUIT
+    stop_grace_period: 30s
+    <<: *hardening
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 256M
+        reservations:
+          memory: 64M
+    logging: *logging
+
+  # ==========================================================================
+  # Backup - scheduled logical backups
+  # ==========================================================================
+  # Uses the postgres image for a pg_dump version matching the server. A newer
+  # client can read an older server, but never the reverse.
+  #
+  # This provides logical backups on a fixed interval. Combined with the WAL
+  # archiving configured on the postgres service above, recovery to an arbitrary
+  # point in time is possible. Dumps alone give an RPO equal to the interval.
+  pg-backup:
+    image: postgres:15-alpine
+    restart: unless-stopped
+    entrypoint: ["/bin/sh", "/scripts/pg_backup.sh", "--loop"]
+    # Non-root: postgres-init chowned /backups to this user, so no root is needed
+    # to write dumps.
+    user: postgres
+    environment:
+      PGHOST: postgres
+      PGPORT: "5432"
+      PGDATABASE: ${POSTGRES_DB:-agent_platform}
+      PGUSER: ${POSTGRES_USER:?POSTGRES_USER must be set}
+      PGPASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be set}
+      BACKUP_DIR: /backups
+      BACKUP_RETENTION_DAYS: ${BACKUP_RETENTION_DAYS:-14}
+      BACKUP_SCHEDULE_SECONDS: ${BACKUP_SCHEDULE_SECONDS:-86400}
+    volumes:
+      - ./scripts:/scripts:ro
+      - postgres-backups:/backups
+    networks:
+      - data
+    depends_on:
+      postgres:
+        condition: service_healthy
+      postgres-init:
+        condition: service_completed_successfully
+    stop_grace_period: 30s
+    security_opt:
+      - no-new-privileges:true
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 512M
+    logging: *logging
+
+# =============================================================================
+# Networks - segmented so a compromise in one tier cannot reach the others
+# =============================================================================
+networks:
+  # Public-facing tier: proxy, frontend, API.
+  edge:
+    name: agent-edge
+  # Data tier: internal:true means no route to or from the internet at all, so
+  # even a compromised database container cannot exfiltrate outbound.
+  data:
+    name: agent-data
+    internal: true
+  # Docker API tier: kept separate so only the API and worker can reach the
+  # broker.
+  sandbox:
+    name: agent-sandbox
+    internal: true
+
+# =============================================================================
+# Volumes
+# =============================================================================
+# Local driver keeps data on this host, which means the host is a single point of
+# failure. For real durability, back these with replicated/network storage or
+# ship backups offsite (see pg_backup.sh BACKUP_S3_URI).
+volumes:
+  postgres-data:
+    name: agent-postgres-data
+  postgres-wal-archive:
+    name: agent-postgres-wal-archive
+  postgres-backups:
+    name: agent-postgres-backups
+  redis-data:
+    name: agent-redis-data
+  certbot-webroot:
+    name: agent-certbot-webroot

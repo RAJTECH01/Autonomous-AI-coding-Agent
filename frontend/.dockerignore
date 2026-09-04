@@ -1,0 +1,32 @@
+# Build context hygiene for the frontend image.
+# node_modules is reinstalled with `npm ci` inside the build stage so the
+# lockfile - not the host's platform-specific tree - decides the dependencies.
+
+### Secrets ###
+.env
+.env.*
+!.env.production.example
+
+### Dependencies and build output (regenerated in the build stage) ###
+node_modules/
+dist/
+.vite/
+*.tsbuildinfo
+
+### Caches and logs ###
+.eslintcache
+npm-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+coverage/
+
+### Docs and VCS metadata ###
+.git/
+.gitignore
+*.md
+
+### Editor / OS ###
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

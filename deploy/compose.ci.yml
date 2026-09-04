@@ -1,0 +1,213 @@
+###############################################################################
+# CI end-to-end stack.
+#
+# Purpose: boot the PRODUCTION image targets and prove the whole system serves
+# real traffic before anything is released. Run via deploy/scripts/smoke_test.sh.
+#
+# Differences from compose.prod.yml, and why:
+#   * builds locally instead of pulling digests - the images under test are the
+#     ones this commit just produced, and they have no registry reference yet
+#   * plaintext proxy template - no certificates exist on a CI runner
+#   * throwaway credentials, ephemeral volumes, no backup service
+#   * ENVIRONMENT=production is KEPT DELIBERATELY. It runs the production
+#     hardening validator in app/core/config.py, so a config that would crash a
+#     real deploy on boot fails the pull request instead.
+#
+# Everything else - non-root users, read-only root filesystems, dropped
+# capabilities, network segmentation, health checks, the migration gate - matches
+# production, because those are exactly the things that break on first deploy.
+###############################################################################
+
+x-ci-backend-env: &ci-backend-env
+  ENVIRONMENT: production
+  DEBUG: "false"
+  # 48 chars, throwaway, CI-only. Satisfies the >=32 character production rule.
+  SECRET_KEY: ci-only-not-a-real-secret-000000000000000000000000
+  ALLOWED_ORIGINS: '["http://localhost:8080"]'
+
+  POSTGRES_SERVER: postgres
+  POSTGRES_PORT: "5432"
+  POSTGRES_DB: agent_platform
+  POSTGRES_USER: agent
+  POSTGRES_PASSWORD: ci-postgres-password
+
+  REDIS_HOST: redis
+  REDIS_PORT: "6379"
+  REDIS_DB: "0"
+
+  # No provider keys in CI. Nothing in the smoke test calls a model, and a real
+  # key must never reach a pull-request build.
+  ANTHROPIC_API_KEY: ""
+  OPENAI_API_KEY: ""
+  GEMINI_API_KEY: ""
+
+  DOCKER_HOST: tcp://sandbox-broker:2375
+  SANDBOX_ALLOW_HOST_FALLBACK: "false"
+  TMPDIR: /tmp/agent-sandboxes
+  ALEMBIC_UPGRADE_ON_START: "0"
+
+services:
+  postgres:
+    image: postgres:15-alpine
+    environment:
+      POSTGRES_DB: agent_platform
+      POSTGRES_USER: agent
+      POSTGRES_PASSWORD: ci-postgres-password
+      POSTGRES_INITDB_ARGS: "--encoding=UTF8 --locale=C"
+    # tmpfs, not a volume: CI data is disposable and RAM-backed storage makes the
+    # whole run faster.
+    tmpfs:
+      - /var/lib/postgresql/data
+    networks: [data]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U agent -d agent_platform"]
+      interval: 3s
+      timeout: 5s
+      retries: 20
+    logging: { driver: json-file, options: { max-size: "10m", max-file: "2" } }
+
+  redis:
+    image: redis:7-alpine
+    command: ["redis-server", "/usr/local/etc/redis/redis.conf"]
+    volumes:
+      - ./redis/redis.conf:/usr/local/etc/redis/redis.conf:ro
+    tmpfs:
+      - /data
+    networks: [data]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 3s
+      timeout: 5s
+      retries: 20
+    logging: { driver: json-file, options: { max-size: "10m", max-file: "2" } }
+
+  sandbox-broker:
+    image: tecnativa/docker-socket-proxy:0.2.0
+    environment:
+      CONTAINERS: "1"
+      POST: "1"
+      EXEC: "1"
+      IMAGES: "1"
+      INFO: "1"
+      VERSION: "1"
+      PING: "1"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    networks: [sandbox]
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:2375/_ping || exit 1"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    logging: { driver: json-file, options: { max-size: "10m", max-file: "2" } }
+
+  # Proves migrations apply cleanly to an empty database on every pull request.
+  migrate:
+    build:
+      context: ../backend
+      target: api
+    command: ["alembic", "upgrade", "head"]
+    environment:
+      <<: *ci-backend-env
+      WAIT_FOR_POSTGRES: "1"
+      WAIT_TIMEOUT: "90"
+    depends_on:
+      postgres: { condition: service_healthy }
+    networks: [data]
+    restart: "no"
+    read_only: true
+    tmpfs: ["/tmp:size=64m"]
+    security_opt: ["no-new-privileges:true"]
+    cap_drop: [ALL]
+    logging: { driver: json-file, options: { max-size: "10m", max-file: "2" } }
+
+  backend:
+    build:
+      context: ../backend
+      target: api
+    environment:
+      <<: *ci-backend-env
+      WAIT_FOR_POSTGRES: "1"
+      WAIT_FOR_REDIS: "1"
+      GRACEFUL_TIMEOUT: "10"
+    depends_on:
+      postgres: { condition: service_healthy }
+      redis: { condition: service_healthy }
+      migrate: { condition: service_completed_successfully }
+      sandbox-broker: { condition: service_healthy }
+    networks: [edge, data, sandbox]
+    volumes:
+      # Host path identity, which works here because CI runners are Linux.
+      - /tmp/agent-sandboxes:/tmp/agent-sandboxes
+    read_only: true
+    tmpfs: ["/tmp:size=128m"]
+    security_opt: ["no-new-privileges:true"]
+    cap_drop: [ALL]
+    init: true
+    stop_grace_period: 15s
+    logging: { driver: json-file, options: { max-size: "10m", max-file: "2" } }
+
+  worker:
+    build:
+      context: ../backend
+      target: worker
+    environment:
+      <<: *ci-backend-env
+      WAIT_FOR_REDIS: "1"
+      WAIT_FOR_POSTGRES: "1"
+      CELERY_CONCURRENCY: "1"
+    depends_on:
+      redis: { condition: service_healthy }
+      postgres: { condition: service_healthy }
+      migrate: { condition: service_completed_successfully }
+      sandbox-broker: { condition: service_healthy }
+    networks: [data, sandbox]
+    volumes:
+      - /tmp/agent-sandboxes:/tmp/agent-sandboxes
+    read_only: true
+    tmpfs: ["/tmp:size=128m"]
+    security_opt: ["no-new-privileges:true"]
+    cap_drop: [ALL]
+    init: true
+    stop_grace_period: 15s
+    logging: { driver: json-file, options: { max-size: "10m", max-file: "2" } }
+
+  frontend:
+    build:
+      context: ../frontend
+      target: production
+    networks: [edge]
+    read_only: true
+    tmpfs:
+      - /tmp:size=32m
+      - /var/cache/nginx:size=32m
+    security_opt: ["no-new-privileges:true"]
+    cap_drop: [ALL]
+    logging: { driver: json-file, options: { max-size: "10m", max-file: "2" } }
+
+  reverse-proxy:
+    build:
+      context: ./reverse-proxy
+    environment:
+      # Plaintext: no certificates on a CI runner.
+      NGINX_ENVSUBST_TEMPLATE_DIR: /etc/nginx/templates/http
+      PUBLIC_HOSTNAME: localhost
+    ports:
+      - "8080:8080"
+    depends_on:
+      backend: { condition: service_healthy }
+      frontend: { condition: service_started }
+    networks: [edge]
+    read_only: true
+    tmpfs: ["/tmp:size=64m"]
+    security_opt: ["no-new-privileges:true"]
+    cap_drop: [ALL]
+    stop_signal: SIGQUIT
+    logging: { driver: json-file, options: { max-size: "10m", max-file: "2" } }
+
+networks:
+  edge:
+  data:
+    internal: true
+  sandbox:
+    internal: true

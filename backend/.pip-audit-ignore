@@ -1,0 +1,29 @@
+# Dependency vulnerabilities accepted with justification.
+#
+# The security CI stage reads this file and passes each id to pip-audit as
+# --ignore-vuln. Every entry needs a reason and a review date; an entry with no
+# fix available is a tracked risk, not a resolved one.
+#
+# Format: one advisory id per line. Comments and blank lines are ignored.
+
+# ---------------------------------------------------------------------------
+# PYSEC-2026-1325 - ecdsa 0.19.2
+#
+# Reached transitively: python-jose[cryptography] -> ecdsa (confirmed with
+# `pip show ecdsa` -> Required-by: python-jose).
+#
+# NO FIX VERSION EXISTS. pip-audit reports an empty "Fix Versions" column, so
+# there is no upgrade that clears it and failing the build on it would block
+# every pull request indefinitely.
+#
+# Exposure assessment: the advisory concerns side-channel resistance in ecdsa's
+# pure-Python implementation. This application signs JWTs with HS256
+# (settings.ALGORITHM = "HS256"), which is HMAC-SHA256 and does not use ECDSA at
+# all. The vulnerable code path is not reachable from how python-jose is used
+# here. It would become reachable if ALGORITHM were changed to ES256/ES384/ES512.
+#
+# REMEDIATION (recommended, not yet done): replace python-jose with PyJWT.
+# python-jose is minimally maintained and drags in ecdsa and rsa; PyJWT uses
+# `cryptography` directly and would drop this dependency entirely. Tracked in
+# docs/CICD.md "Accepted security findings".
+PYSEC-2026-1325

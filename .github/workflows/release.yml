@@ -1,0 +1,662 @@
+###############################################################################
+# Release pipeline.
+#
+#   Trigger by pushing a semver tag:   git tag v1.2.0 && git push origin v1.2.0
+#   Or manually via workflow_dispatch, supplying the version.
+#
+# ORDER OF OPERATIONS, AND WHY
+#   1. verify        re-runs the entire pull-request gate on this exact commit
+#   2. build-push    immutable, digest-addressed images pushed to the registry
+#   3. release-tag   git tag + GitHub release recording the exact digests
+#   4. backup        pre-migration database backup (the rollback floor)
+#   5. migrate       alembic upgrade head, run once, before any new code serves
+#   6. deploy        digest-pinned rollout on the target host
+#   7. health-check  verifies the deployment actually serves correctly
+#   8. rollback      runs automatically if 6 or 7 fail
+#
+# NOTHING CAN SKIP STEP 1. Every later job declares `needs: verify` (directly or
+# transitively), so a failing lint, type, test, migration or security check makes
+# the release impossible - not merely discouraged.
+#
+# WHAT THIS DOES NOT DO
+#   The deploy step drives Docker Compose over SSH on a single host. That means a
+#   brief interruption while containers are replaced, and no automatic
+#   rescheduling if the host itself dies. Compose is not a full orchestrator; see
+#   docs/DEPLOYMENT.md "What Compose does not give you" for what to move to when
+#   zero-downtime or multi-node becomes a requirement.
+#
+# REQUIRED CONFIGURATION
+#   Secrets:
+#     DEPLOY_SSH_KEY        private key with access to the deployment host
+#     DEPLOY_HOST           hostname or IP of the deployment host
+#     DEPLOY_USER           SSH user (must be in the docker group)
+#     PRODUCTION_URL        public base URL used for health checks
+#   Environment `production` should require manual approval, which is what makes
+#   the migration step a deliberate act rather than an automatic one.
+###############################################################################
+
+name: Release
+
+on:
+  push:
+    tags: ['v*.*.*']
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version to release, e.g. v1.2.0'
+        required: true
+        type: string
+      dry_run:
+        description: 'Build and push images but do not migrate or deploy'
+        required: false
+        type: boolean
+        default: false
+
+# Never run two production deploys at once, and never cancel one in flight:
+# interrupting a rollout or a migration is how you get a half-deployed system.
+concurrency:
+  group: production-release
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  REGISTRY: ghcr.io
+  PYTHON_VERSION: '3.11'
+
+jobs:
+  # ==========================================================================
+  # 0. Resolve the version being released
+  # ==========================================================================
+  version:
+    name: Resolve version
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.v.outputs.version }}
+      image_prefix: ${{ steps.v.outputs.image_prefix }}
+    steps:
+      - id: v
+        run: |
+          set -euo pipefail
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            version="${{ inputs.version }}"
+          else
+            version="${GITHUB_REF#refs/tags/}"
+          fi
+
+          # Reject anything that is not strict semver with a leading v. An
+          # ambiguous version makes the whole audit trail useless.
+          if ! printf '%s' "$version" | grep -qE '^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$'; then
+            echo "::error::'$version' is not a valid semver tag (expected vMAJOR.MINOR.PATCH)"
+            exit 1
+          fi
+
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          # Lowercase: registry namespaces are case-sensitive and GitHub org names
+          # frequently are not lowercase.
+          echo "image_prefix=${REGISTRY}/$(echo '${{ github.repository }}' | tr '[:upper:]' '[:lower:]')" >> "$GITHUB_OUTPUT"
+          echo "Releasing $version"
+
+  # ==========================================================================
+  # 1. MANDATORY GATE - the full pull-request pipeline, on this commit
+  # ==========================================================================
+  # Reuses .github/workflows/pr.yml rather than restating its stages, so the
+  # release gate and the merge gate can never drift apart. All 11 stages run:
+  # dependencies, formatting, lint, types, unit, integration, security, image
+  # build, migration verification, frontend tests and end-to-end.
+  verify:
+    name: Mandatory checks
+    needs: [version]
+    uses: ./.github/workflows/pr.yml
+    permissions:
+      contents: read
+
+  # ==========================================================================
+  # 2. Build immutable images and push them
+  # ==========================================================================
+  build-push:
+    name: Build and push (${{ matrix.name }})
+    runs-on: ubuntu-latest
+    needs: [version, verify]
+    timeout-minutes: 40
+    permissions:
+      contents: read
+      packages: write
+      # Required for build provenance attestation.
+      id-token: write
+      attestations: write
+    # No job-level outputs: a matrix job's outputs collapse to whichever leg
+    # finished last. Digests travel through upload-artifact and are reassembled by
+    # the release-tag job instead.
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - name: backend-api
+            context: ./backend
+            target: api
+          - name: backend-worker
+            context: ./backend
+            target: worker
+          - name: frontend
+            context: ./frontend
+            target: production
+          - name: reverse-proxy
+            context: ./deploy/reverse-proxy
+            target: production
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Log in to the registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Refuse to overwrite an existing release tag
+        # Immutability, enforced. If this version already exists in the registry,
+        # something is being re-released - which would silently change what a
+        # previously recorded digest means for anyone who pulled by tag.
+        run: |
+          set -euo pipefail
+          ref="${{ needs.version.outputs.image_prefix }}/${{ matrix.name }}:${{ needs.version.outputs.version }}"
+          if docker manifest inspect "$ref" >/dev/null 2>&1; then
+            echo "::error::$ref already exists in the registry. Releases are immutable; bump the version instead."
+            exit 1
+          fi
+          echo "$ref is free"
+
+      - name: Build and push
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: ${{ matrix.context }}
+          target: ${{ matrix.target }}
+          push: true
+          # Three tags: the immutable version, the immutable commit sha, and the
+          # moving `latest`. Deployments use the DIGEST from the output below, not
+          # any of these tags.
+          tags: |
+            ${{ needs.version.outputs.image_prefix }}/${{ matrix.name }}:${{ needs.version.outputs.version }}
+            ${{ needs.version.outputs.image_prefix }}/${{ matrix.name }}:${{ github.sha }}
+            ${{ needs.version.outputs.image_prefix }}/${{ matrix.name }}:latest
+          cache-from: type=gha,scope=${{ matrix.name }}
+          cache-to: type=gha,scope=${{ matrix.name }},mode=max
+          # Provenance and SBOM make the artifact auditable: what went in, and
+          # which builder produced it.
+          provenance: true
+          sbom: true
+          labels: |
+            org.opencontainers.image.title=${{ matrix.name }}
+            org.opencontainers.image.version=${{ needs.version.outputs.version }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@v1
+        with:
+          subject-name: ${{ needs.version.outputs.image_prefix }}/${{ matrix.name }}
+          subject-digest: ${{ steps.build.outputs.digest }}
+          push-to-registry: true
+
+      - name: Record the digest
+        # The digest is the only truly immutable reference. Deployment consumes
+        # these files so the running system is pinned to exact bytes.
+        run: |
+          mkdir -p digests
+          printf '%s@%s\n' \
+            "${{ needs.version.outputs.image_prefix }}/${{ matrix.name }}" \
+            "${{ steps.build.outputs.digest }}" > "digests/${{ matrix.name }}.txt"
+          cat "digests/${{ matrix.name }}.txt"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: digest-${{ matrix.name }}
+          path: digests/${{ matrix.name }}.txt
+          retention-days: 90
+
+  # ==========================================================================
+  # 3. Collect digests and tag the release
+  # ==========================================================================
+  release-tag:
+    name: Tag release
+    runs-on: ubuntu-latest
+    needs: [version, build-push]
+    permissions:
+      contents: write
+    outputs:
+      backend_api: ${{ steps.collect.outputs.backend_api }}
+      backend_worker: ${{ steps.collect.outputs.backend_worker }}
+      frontend: ${{ steps.collect.outputs.frontend }}
+      reverse_proxy: ${{ steps.collect.outputs.reverse_proxy }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: digest-*
+          path: digests
+          merge-multiple: true
+
+      - name: Collect digests
+        id: collect
+        run: |
+          set -euo pipefail
+          for name in backend-api backend-worker frontend reverse-proxy; do
+            file="digests/${name}.txt"
+            [ -f "$file" ] || { echo "::error::missing digest for $name"; exit 1; }
+            ref=$(tr -d '\n' < "$file")
+            key=$(echo "$name" | tr '-' '_')
+            echo "${key}=${ref}" >> "$GITHUB_OUTPUT"
+            echo "${name}: ${ref}"
+          done
+
+      - name: Write the deployment manifest
+        # A single file that fully determines what runs in production. Attached to
+        # the release so any past deployment can be reconstructed byte for byte.
+        run: |
+          {
+            echo "# Deployment manifest for ${{ needs.version.outputs.version }}"
+            echo "# commit: ${{ github.sha }}"
+            echo "# built:  $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+            echo "BACKEND_API_IMAGE=${{ steps.collect.outputs.backend_api }}"
+            echo "BACKEND_WORKER_IMAGE=${{ steps.collect.outputs.backend_worker }}"
+            echo "FRONTEND_IMAGE=${{ steps.collect.outputs.frontend }}"
+            echo "REVERSE_PROXY_IMAGE=${{ steps.collect.outputs.reverse_proxy }}"
+          } > deployment-manifest.env
+          cat deployment-manifest.env
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: deployment-manifest
+          path: deployment-manifest.env
+          retention-days: 90
+
+      - name: Create the git tag if it does not exist
+        # A workflow_dispatch release has no tag yet. A tag push already has one.
+        run: |
+          set -euo pipefail
+          version="${{ needs.version.outputs.version }}"
+          if git rev-parse "$version" >/dev/null 2>&1; then
+            echo "tag $version already exists"
+          else
+            git config user.name  "github-actions[bot]"
+            git config user.email "github-actions[bot]@users.noreply.github.com"
+            git tag -a "$version" -m "Release $version"
+            git push origin "$version"
+            echo "created tag $version"
+          fi
+
+      - name: Create the GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.version.outputs.version }}
+          name: ${{ needs.version.outputs.version }}
+          generate_release_notes: true
+          files: deployment-manifest.env
+          body: |
+            ## Images (digest-pinned, immutable)
+
+            | Service | Reference |
+            | --- | --- |
+            | backend-api | `${{ steps.collect.outputs.backend_api }}` |
+            | backend-worker | `${{ steps.collect.outputs.backend_worker }}` |
+            | frontend | `${{ steps.collect.outputs.frontend }}` |
+            | reverse-proxy | `${{ steps.collect.outputs.reverse_proxy }}` |
+
+            Commit: ${{ github.sha }}
+
+            All mandatory checks passed before these images were built.
+            Deploy with `deployment-manifest.env` as the image source.
+
+  # ==========================================================================
+  # 4. Pre-migration backup - the rollback floor
+  # ==========================================================================
+  # Taken BEFORE the migration, because a migration is the one deploy step a
+  # container rollback cannot undo: reverting the code does not un-drop a column.
+  # If this fails, the release stops here.
+  backup:
+    name: Pre-migration backup
+    runs-on: ubuntu-latest
+    needs: [version, release-tag]
+    if: ${{ !inputs.dry_run }}
+    environment: production
+    timeout-minutes: 30
+    steps:
+      - name: Set up SSH
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.DEPLOY_SSH_KEY }}" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          ssh-keyscan -H "${{ secrets.DEPLOY_HOST }}" >> ~/.ssh/known_hosts 2>/dev/null
+
+      - name: Take a verified backup
+        # pg_backup.sh verifies the dump with `pg_restore --list` before accepting
+        # it, so a corrupt backup fails here rather than at recovery time.
+        run: |
+          ssh -i ~/.ssh/id_ed25519 "${{ secrets.DEPLOY_USER }}@${{ secrets.DEPLOY_HOST }}" bash -euo pipefail <<'REMOTE'
+            cd /opt/agent-platform/deploy
+            echo "Taking pre-migration backup..."
+            docker compose -f compose.prod.yml --env-file ../.env \
+              run --rm --no-deps pg-backup /bin/sh /scripts/pg_backup.sh
+            echo "Backups on host:"
+            docker compose -f compose.prod.yml --env-file ../.env \
+              run --rm --no-deps --entrypoint /bin/sh pg-backup \
+              -c 'ls -lh /backups/*.dump | tail -5'
+          REMOTE
+
+      - name: Record the current digests for rollback
+        # Captured before anything changes. Without this the rollback job has no
+        # known-good target to return to.
+        run: |
+          ssh -i ~/.ssh/id_ed25519 "${{ secrets.DEPLOY_USER }}@${{ secrets.DEPLOY_HOST }}" bash -euo pipefail <<'REMOTE' > previous-manifest.env
+            cd /opt/agent-platform
+            if [ -f deployment-manifest.env ]; then
+              cat deployment-manifest.env
+            else
+              echo "# no previous manifest - this is the first deployment"
+            fi
+          REMOTE
+          cat previous-manifest.env
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: previous-manifest
+          path: previous-manifest.env
+          retention-days: 90
+
+  # ==========================================================================
+  # 5. Database migration
+  # ==========================================================================
+  # Runs as a one-shot container from the exact API image being released, against
+  # the production database, before any new application container serves traffic.
+  # Old code running against the new schema is the safe ordering for additive
+  # migrations; a destructive migration needs the expand/contract procedure in
+  # docs/DEPLOYMENT.md and must not be released this way.
+  migrate:
+    name: Database migration
+    runs-on: ubuntu-latest
+    needs: [version, release-tag, backup]
+    if: ${{ !inputs.dry_run }}
+    environment: production
+    timeout-minutes: 30
+    steps:
+      - name: Set up SSH
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.DEPLOY_SSH_KEY }}" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          ssh-keyscan -H "${{ secrets.DEPLOY_HOST }}" >> ~/.ssh/known_hosts 2>/dev/null
+
+      - name: Show pending migrations
+        run: |
+          ssh -i ~/.ssh/id_ed25519 "${{ secrets.DEPLOY_USER }}@${{ secrets.DEPLOY_HOST }}" bash -euo pipefail <<REMOTE
+            cd /opt/agent-platform/deploy
+            export BACKEND_API_IMAGE='${{ needs.release-tag.outputs.backend_api }}'
+            export BACKEND_WORKER_IMAGE='${{ needs.release-tag.outputs.backend_worker }}'
+            export FRONTEND_IMAGE='${{ needs.release-tag.outputs.frontend }}'
+            export REVERSE_PROXY_IMAGE='${{ needs.release-tag.outputs.reverse_proxy }}'
+
+            docker pull "\$BACKEND_API_IMAGE"
+
+            echo "--- current revision ---"
+            docker compose -f compose.prod.yml --env-file ../.env \
+              run --rm migrate alembic current
+            echo "--- target revision ---"
+            docker compose -f compose.prod.yml --env-file ../.env \
+              run --rm migrate alembic heads
+          REMOTE
+
+      - name: Apply migrations
+        run: |
+          ssh -i ~/.ssh/id_ed25519 "${{ secrets.DEPLOY_USER }}@${{ secrets.DEPLOY_HOST }}" bash -euo pipefail <<REMOTE
+            cd /opt/agent-platform/deploy
+            export BACKEND_API_IMAGE='${{ needs.release-tag.outputs.backend_api }}'
+
+            # The migrate service exits non-zero on failure, which fails this step
+            # and stops the release before any new code is deployed.
+            docker compose -f compose.prod.yml --env-file ../.env \
+              run --rm migrate alembic upgrade head
+
+            echo "--- revision after upgrade ---"
+            docker compose -f compose.prod.yml --env-file ../.env \
+              run --rm migrate alembic current
+          REMOTE
+
+  # ==========================================================================
+  # 6. Deploy
+  # ==========================================================================
+  deploy:
+    name: Deploy
+    runs-on: ubuntu-latest
+    needs: [version, release-tag, migrate]
+    if: ${{ !inputs.dry_run }}
+    environment: production
+    timeout-minutes: 30
+    outputs:
+      deployed: ${{ steps.rollout.outcome }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up SSH
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.DEPLOY_SSH_KEY }}" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          ssh-keyscan -H "${{ secrets.DEPLOY_HOST }}" >> ~/.ssh/known_hosts 2>/dev/null
+
+      - name: Sync deployment configuration to the host
+        # Compose files, nginx config, redis config and the backup scripts. Not
+        # secrets: /opt/agent-platform/.env is managed on the host and never
+        # transported through CI.
+        run: |
+          rsync -az --delete -e "ssh -i ~/.ssh/id_ed25519" \
+            deploy/ "${{ secrets.DEPLOY_USER }}@${{ secrets.DEPLOY_HOST }}:/opt/agent-platform/deploy/"
+
+      - name: Roll out the new images
+        id: rollout
+        run: |
+          ssh -i ~/.ssh/id_ed25519 "${{ secrets.DEPLOY_USER }}@${{ secrets.DEPLOY_HOST }}" bash -euo pipefail <<REMOTE
+            cd /opt/agent-platform
+
+            # Persist the manifest so the host records exactly what is running and
+            # the next release can read it as its rollback target.
+            cat > deployment-manifest.env <<'MANIFEST'
+          BACKEND_API_IMAGE=${{ needs.release-tag.outputs.backend_api }}
+          BACKEND_WORKER_IMAGE=${{ needs.release-tag.outputs.backend_worker }}
+          FRONTEND_IMAGE=${{ needs.release-tag.outputs.frontend }}
+          REVERSE_PROXY_IMAGE=${{ needs.release-tag.outputs.reverse_proxy }}
+          MANIFEST
+
+            cd deploy
+            # Two env files: .env holds configuration and secrets, the manifest
+            # holds the digest-pinned image references.
+            COMPOSE="docker compose -f compose.prod.yml --env-file ../.env --env-file ../deployment-manifest.env"
+
+            echo "--- pulling images by digest ---"
+            \$COMPOSE pull --quiet
+
+            echo "--- starting ---"
+            # --wait blocks until every service with a health check reports
+            # healthy, and exits non-zero if any does not within the timeout. That
+            # makes a failed rollout fail this step rather than appear to succeed.
+            \$COMPOSE up -d --remove-orphans --wait --wait-timeout 240
+
+            echo "--- state ---"
+            \$COMPOSE ps
+          REMOTE
+
+      - name: Reclaim disk from superseded images
+        # A deploy host that fills up with old images stops being able to deploy.
+        if: success()
+        run: |
+          ssh -i ~/.ssh/id_ed25519 "${{ secrets.DEPLOY_USER }}@${{ secrets.DEPLOY_HOST }}" \
+            'docker image prune -f --filter "until=168h"' || true
+
+  # ==========================================================================
+  # 7. Post-deploy health verification
+  # ==========================================================================
+  # The gate that decides whether this release stands. Runs the same script the
+  # pull-request pipeline uses, so a passing CI run and a passing deploy mean the
+  # same set of assertions held.
+  health-check:
+    name: Health verification
+    runs-on: ubuntu-latest
+    needs: [version, deploy]
+    if: ${{ !inputs.dry_run }}
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Verify the deployment
+        env:
+          BASE_URL: ${{ secrets.PRODUCTION_URL }}
+          TIMEOUT: '180'
+          # Production expectations the dev stack does not have: the interactive
+          # docs and the unauthenticated metrics endpoints must not be public.
+          EXPECT_DOCS_BLOCKED: '1'
+          EXPECT_METRICS_BLOCKED: '1'
+        run: bash deploy/scripts/health_check.sh
+
+      - name: Confirm the running version
+        # Guards against a rollout that reported success while the old containers
+        # kept serving - the health check alone cannot tell the versions apart.
+        env:
+          BASE_URL: ${{ secrets.PRODUCTION_URL }}
+        run: |
+          set -euo pipefail
+          body=$(curl -fsS "${BASE_URL%/}/api/v1/health")
+          echo "$body"
+          expected='${{ needs.version.outputs.version }}'
+          # settings.VERSION has no leading v.
+          if ! echo "$body" | grep -q "\"version\":\"${expected#v}\""; then
+            echo "::warning::/health reports a different version than ${expected}. Confirm app/core/config.py VERSION is updated as part of the release."
+          fi
+
+  # ==========================================================================
+  # 8. Automatic rollback
+  # ==========================================================================
+  # Fires when the rollout or the health verification fails. Returns the
+  # application containers to the previously recorded digests and re-verifies.
+  #
+  # IMPORTANT AND DELIBERATE: this rolls back CODE ONLY. It does not reverse the
+  # migration, because automatically running `alembic downgrade` against a
+  # production database on a failed health check risks destroying data that the
+  # new schema already accepted. The pre-migration backup from step 4 is the
+  # recovery path for a bad migration, and it is an explicit human decision.
+  # Procedure: docs/DEPLOYMENT.md "Database recovery strategy".
+  rollback:
+    name: Automatic rollback
+    runs-on: ubuntu-latest
+    needs: [version, release-tag, deploy, health-check]
+    if: ${{ always() && !inputs.dry_run && (needs.deploy.result == 'failure' || needs.health-check.result == 'failure') }}
+    environment: production
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: previous-manifest
+
+      - name: Set up SSH
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.DEPLOY_SSH_KEY }}" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          ssh-keyscan -H "${{ secrets.DEPLOY_HOST }}" >> ~/.ssh/known_hosts 2>/dev/null
+
+      - name: Capture diagnostics before changing anything
+        # Once the containers are replaced their logs are gone, and those logs are
+        # the only evidence of why the release failed.
+        run: |
+          ssh -i ~/.ssh/id_ed25519 "${{ secrets.DEPLOY_USER }}@${{ secrets.DEPLOY_HOST }}" bash <<'REMOTE' > failure-diagnostics.log 2>&1 || true
+            cd /opt/agent-platform/deploy
+            COMPOSE="docker compose -f compose.prod.yml --env-file ../.env --env-file ../deployment-manifest.env"
+            echo "===== ps ====="
+            $COMPOSE ps -a
+            for svc in backend worker beat frontend reverse-proxy migrate postgres redis; do
+              echo "===== logs: $svc ====="
+              $COMPOSE logs --no-color --tail=150 "$svc" 2>&1 || true
+            done
+          REMOTE
+          tail -100 failure-diagnostics.log
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: failure-diagnostics
+          path: failure-diagnostics.log
+          retention-days: 90
+
+      - name: Roll back to the previous images
+        run: |
+          set -euo pipefail
+          if grep -q '^# no previous manifest' previous-manifest.env; then
+            echo "::error::This was the first deployment, so there is no previous version to roll back to. The stack has been left as-is for inspection; see the failure-diagnostics artifact."
+            exit 1
+          fi
+
+          scp -i ~/.ssh/id_ed25519 previous-manifest.env \
+            "${{ secrets.DEPLOY_USER }}@${{ secrets.DEPLOY_HOST }}:/opt/agent-platform/rollback-manifest.env"
+
+          ssh -i ~/.ssh/id_ed25519 "${{ secrets.DEPLOY_USER }}@${{ secrets.DEPLOY_HOST }}" bash -euo pipefail <<'REMOTE'
+            cd /opt/agent-platform
+            cp rollback-manifest.env deployment-manifest.env
+            cd deploy
+            COMPOSE="docker compose -f compose.prod.yml --env-file ../.env --env-file ../deployment-manifest.env"
+            echo "--- rolling back to ---"
+            cat ../deployment-manifest.env
+            $COMPOSE pull --quiet
+            $COMPOSE up -d --remove-orphans --wait --wait-timeout 240
+            $COMPOSE ps
+          REMOTE
+
+      - name: Verify the rollback restored service
+        env:
+          BASE_URL: ${{ secrets.PRODUCTION_URL }}
+          TIMEOUT: '180'
+          EXPECT_DOCS_BLOCKED: '1'
+          EXPECT_METRICS_BLOCKED: '1'
+        run: bash deploy/scripts/health_check.sh
+
+      - name: Fail the release
+        # The rollback succeeding does not make the release successful. This step
+        # guarantees the workflow ends red so the failure is not mistaken for a
+        # completed deploy.
+        run: |
+          echo "::error::Release ${{ needs.version.outputs.version }} failed its health checks and was rolled back to the previous version. Service is restored. Investigate the failure-diagnostics artifact before retrying."
+          exit 1
+
+  # ==========================================================================
+  # Summary
+  # ==========================================================================
+  summary:
+    name: Release summary
+    runs-on: ubuntu-latest
+    needs: [version, verify, release-tag, health-check]
+    if: always()
+    steps:
+      - name: Write the summary
+        run: |
+          {
+            echo "# Release ${{ needs.version.outputs.version }}"
+            echo ""
+            echo "| Stage | Result |"
+            echo "| --- | --- |"
+            echo "| Mandatory checks | ${{ needs.verify.result || 'n/a' }} |"
+            echo "| Build and push | ${{ needs.release-tag.result }} |"
+            echo "| Health verification | ${{ needs.health-check.result }} |"
+            echo ""
+            if [ "${{ needs.health-check.result }}" = "success" ]; then
+              echo "Deployment is live and verified."
+            elif [ "${{ github.event.inputs.dry_run }}" = "true" ]; then
+              echo "Dry run: images were built and pushed; no migration or deployment was performed."
+            else
+              echo "Deployment did not complete. Check the rollback job."
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"

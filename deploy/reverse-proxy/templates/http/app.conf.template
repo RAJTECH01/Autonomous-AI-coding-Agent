@@ -1,0 +1,25 @@
+# Edge server - HTTP only. DEVELOPMENT / INTERNAL USE.
+#
+# Selected by setting NGINX_ENVSUBST_TEMPLATE_DIR=/etc/nginx/templates/http.
+# The nginx entrypoint renders this to /etc/nginx/conf.d/app.conf, substituting
+# only names that exist as environment variables, so nginx's own $host, $uri and
+# $request_id survive untouched.
+#
+# Do not use this in production: credentials and JWTs would cross the network in
+# cleartext. Production uses templates/tls.
+
+server {
+    listen      8080;
+    listen      [::]:8080;
+    server_name ${PUBLIC_HOSTNAME} localhost _;
+
+    # Security headers. No HSTS here - promising HTTPS on a plaintext listener
+    # would lock clients out of a service that cannot answer.
+    add_header X-Content-Type-Options nosniff always;
+    add_header X-Frame-Options        DENY always;
+    add_header Referrer-Policy        strict-origin-when-cross-origin always;
+
+    include /etc/nginx/snippets/app-routes.conf;
+
+    # API docs stay reachable in development; the TLS template blocks them.
+}

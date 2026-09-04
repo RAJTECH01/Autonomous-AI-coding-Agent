@@ -1,0 +1,57 @@
+# Build context hygiene: keep the image small and keep secrets out of layers.
+# Everything listed here is either a secret, a local artifact, or dead weight.
+
+### Secrets (requirement: no secrets in images) ###
+.env
+.env.*
+*.pem
+*.key
+*.crt
+secrets/
+
+### Local virtualenvs (huge, platform-specific, must never be copied) ###
+.venv/
+venv/
+env/
+ENV/
+
+### Python bytecode and caches ###
+__pycache__/
+**/__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.mypy_cache/
+.ruff_cache/
+.pytest_cache/
+
+### Coverage artifacts ###
+# NOTE: tests/ is intentionally NOT excluded. The runtime stages copy only
+# app/, alembic/ and prompts/, so tests never reach the production image, while
+# the `development` target (which copies the whole context) keeps them available
+# for `docker compose exec backend pytest`.
+.coverage
+.coverage.*
+coverage.xml
+htmlcov/
+
+### Local runtime data ###
+.data/
+logs/
+*.log
+*.db
+*.sqlite
+*.sqlite3
+
+### Docs and VCS metadata ###
+.git/
+.gitignore
+docs/
+*.md
+
+### Editor / OS ###
+.vscode/
+.idea/
+*.swp
+.DS_Store
+Thumbs.db

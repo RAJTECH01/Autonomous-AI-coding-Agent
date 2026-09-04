@@ -1,0 +1,13 @@
+TLS certificates are mounted here at run time. Nothing in this directory is
+committed: .gitignore excludes deploy/reverse-proxy/certs/* except this file.
+
+Expected contents on a production host:
+  fullchain.pem   server certificate + intermediate chain
+  privkey.pem     private key, mode 0600, owned by uid 101
+
+Local HTTPS testing (self-signed, browser will warn):
+  openssl req -x509 -nodes -newkey rsa:2048 -days 365 \
+    -keyout privkey.pem -out fullchain.pem -subj "/CN=localhost"
+
+Production: issue via ACME/Let's Encrypt against the /var/www/certbot webroot,
+or mount certificates managed by the platform's secret store.

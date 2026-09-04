@@ -1,0 +1,11 @@
+# Build output and dependencies
+dist/
+node_modules/
+coverage/
+.vite/
+
+# Lockfile: npm owns its formatting
+package-lock.json
+
+# endOfLine is lf, but these are not ours to reformat
+*.md

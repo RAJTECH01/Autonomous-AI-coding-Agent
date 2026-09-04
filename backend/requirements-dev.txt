@@ -1,0 +1,27 @@
+# Development and test dependencies.
+# Installed only in the `development` Dockerfile target and in local venvs.
+# The production runtime image must never contain these.
+
+-r requirements.txt
+
+# --- Test framework ----------------------------------------------------------
+pytest>=8.1.0
+pytest-asyncio>=0.23.5
+pytest-cov>=4.1.0
+
+# --- Test fixtures and doubles -----------------------------------------------
+vcrpy>=6.0.1                    # records/replays AI provider HTTP interactions
+aiosqlite>=0.20.0               # in-memory async DB for tests that avoid PostgreSQL
+
+# --- Formatting and linting (CI stages: format, lint) ------------------------
+# Pinned to the versions the rule set in pyproject.toml was calibrated against.
+# A ruff minor bump can add rules to an existing selector and turn a green gate
+# red without a code change, so this pin is load-bearing.
+ruff==0.16.4
+
+# --- Type checking (CI stage: types) -----------------------------------------
+mypy==2.3.1
+
+# --- Security scanning (CI stage: security) ----------------------------------
+pip-audit>=2.7.0                # dependency CVEs from the Python advisory database
+bandit[toml]>=1.7.8             # static analysis for insecure code patterns

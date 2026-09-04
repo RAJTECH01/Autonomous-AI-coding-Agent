@@ -1,0 +1,71 @@
+{
+  "default_version": "1.0.0",
+  "roles": {
+    "requirement_analyzer": {
+      "active_version": "1.0.0",
+      "file": "prompts/requirement_analyzer.txt",
+      "variants": {
+        "default": "1.0.0"
+      }
+    },
+    "project_analyzer": {
+      "active_version": "1.0.0",
+      "file": "prompts/project_analyzer.txt",
+      "variants": {
+        "default": "1.0.0"
+      }
+    },
+    "analyzer": {
+      "active_version": "1.0.0",
+      "file": "prompts/analyzer.txt",
+      "variants": {
+        "default": "1.0.0"
+      }
+    },
+    "planner": {
+      "active_version": "1.0.0",
+      "file": "prompts/planner.txt",
+      "variants": {
+        "default": "1.0.0",
+        "variant_b": "1.1.0-experiment"
+      }
+    },
+    "coder": {
+      "active_version": "1.0.0",
+      "file": "prompts/coder.txt",
+      "variants": {
+        "default": "1.0.0"
+      }
+    },
+    "debugger": {
+      "active_version": "1.0.0",
+      "file": "prompts/debugger.txt",
+      "variants": {
+        "default": "1.0.0"
+      }
+    },
+    "tester": {
+      "active_version": "1.0.0",
+      "file": "prompts/tester.txt",
+      "variants": {
+        "default": "1.0.0"
+      }
+    },
+    "reviewer": {
+      "active_version": "1.0.0",
+      "file": "prompts/reviewer.txt",
+      "variants": {
+        "default": "1.0.0"
+      }
+    }
+  },
+  "ab_testing": {
+    "enabled": true,
+    "allocations": {
+      "planner": {
+        "variant_a": 0.5,
+        "variant_b": 0.5
+      }
+    }
+  }
+}
