@@ -62,3 +62,10 @@ logs/
 .DS_Store
 Thumbs.db
 desktop.ini
+
+### Scratch artifacts from tooling runs (never source) ###
+_*.log
+_*.txt
+_*.db
+_scratch*
+
