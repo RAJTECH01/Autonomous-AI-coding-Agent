@@ -53,3 +53,34 @@ class LimitExceededError(DomainError):
 class AgentLoopGuardrailError(DomainError):
     """Raised when an infinite loop or guardrail violation is detected in agent loop."""
     pass
+
+
+class PersistenceError(DomainError):
+    """Raised when durable storage of agent state fails.
+
+    Exists because blocker B3 was invisible: every persistence call site was wrapped
+    in ``except Exception: logger.warning(...)``, so a run could execute while nothing
+    about it was recorded. Storage failure for a run, a state transition or a plan is
+    now a first-class failure that stops execution rather than a log line.
+    """
+    pass
+
+
+class PlanIntegrityError(DomainError):
+    """Raised when a plan's hash no longer matches the hash a human approved.
+
+    Guards the window between approval and resumption: the plan is re-verified after
+    the worker loads it, not only when approval is granted, so a plan mutated in
+    between is refused at the point of use.
+    """
+    pass
+
+
+class RunClaimError(DomainError):
+    """Raised when a worker cannot claim a run because another worker already has it.
+
+    Not an error condition in the usual sense - it is the expected outcome for the
+    loser of a race. The conditional UPDATE that transitions run state is the single
+    serialization point that makes execution at-most-once.
+    """
+    pass

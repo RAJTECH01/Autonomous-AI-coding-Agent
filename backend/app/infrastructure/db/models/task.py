@@ -1,4 +1,4 @@
-import uuid
+﻿import uuid
 from datetime import datetime
 from typing import Optional, List
 from sqlalchemy import String, ForeignKey, Text, Index, UUID
@@ -16,6 +16,11 @@ class CodingTaskModel(Base, TimestampMixin, SoftDeleteMixin):
     requirement_prompt: Mapped[str] = mapped_column(Text, nullable=False)
     status: Mapped[str] = mapped_column(String(50), default="backlog", nullable=False)
     priority: Mapped[str] = mapped_column(String(20), default="medium", nullable=False)
+    # External session identifier the API exposes to clients. A task is created per
+    # session so agent_runs.task_id resolves to a real row (its FK is NOT NULL and
+    # nothing previously wrote this table at all). Unique so a session maps to exactly
+    # one task and the mapping is idempotent under retry.
+    session_id: Mapped[Optional[uuid.UUID]] = mapped_column(UUID(as_uuid=True), unique=True, index=True, nullable=True)
 
     project: Mapped["ProjectModel"] = relationship(back_populates="tasks")
     agent_runs: Mapped[List["AgentRunModel"]] = relationship(back_populates="task", cascade="all, delete-orphan")

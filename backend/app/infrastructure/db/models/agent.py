@@ -1,4 +1,4 @@
-import uuid
+﻿import uuid
 from datetime import datetime
 from typing import Optional, List, Dict, Any
 from sqlalchemy import String, ForeignKey, Integer, Numeric, Text, Boolean, DateTime, UniqueConstraint, Index, JSON, UUID
@@ -24,6 +24,21 @@ class AgentRunModel(Base, TimestampMixin):
     started_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
     completed_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
 
+    # --- Fields required to resume a run without any in-process state (B2/B3) ---
+    # The original request is gone by the time a worker picks the run up, so
+    # everything needed to rebuild the state machine lives on the row.
+    execution_mode: Mapped[str] = mapped_column(String(50), default="APPROVAL_REQUIRED", server_default="APPROVAL_REQUIRED", nullable=False)
+    user_prompt: Mapped[str] = mapped_column(Text, default="", server_default="", nullable=False)
+    # Lets a restarted process reattach to, or reap, the container this run owns.
+    sandbox_id: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+
+    # --- Durable approval record (B2) ---
+    # approved_plan_hash is compared again after the worker loads the run, so a plan
+    # mutated between approval and resumption is refused at the point of use.
+    approved_by: Mapped[Optional[uuid.UUID]] = mapped_column(UUID(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL", name="fk_agent_runs_approved_by_users"), nullable=True)
+    approved_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    approved_plan_hash: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+
     task: Mapped["CodingTaskModel"] = relationship(back_populates="agent_runs")
     plans: Mapped[List["AgentPlanModel"]] = relationship(back_populates="run", cascade="all, delete-orphan")
     steps: Mapped[List["AgentStepModel"]] = relationship(back_populates="run", cascade="all, delete-orphan")
@@ -34,6 +49,9 @@ class AgentRunModel(Base, TimestampMixin):
     __table_args__ = (
         Index("idx_runs_task_status", "task_id", "status"),
         Index("idx_runs_initiator", "initiator_id", "created_at"),
+        # Supports the stalled-run reaper: find non-terminal runs older than a
+        # threshold without scanning the table.
+        Index("idx_runs_status_created", "status", "created_at"),
     )
 
 
@@ -46,6 +64,9 @@ class AgentPlanModel(Base, TimestampMixin):
     goals_summary: Mapped[str] = mapped_column(Text, nullable=False)
     plan_markdown: Mapped[str] = mapped_column(Text, nullable=False)
     status: Mapped[str] = mapped_column(String(50), default="active", nullable=False)
+    # sha256 over the canonical plan markdown, written when the plan is created.
+    # This is the value a human approves and the value re-verified before execution.
+    plan_hash: Mapped[Optional[str]] = mapped_column(String(64), index=True, nullable=True)
 
     run: Mapped["AgentRunModel"] = relationship(back_populates="plans")
 

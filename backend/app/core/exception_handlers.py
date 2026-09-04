@@ -1,8 +1,11 @@
-from fastapi import Request, status
+﻿from fastapi import Request, status
 from fastapi.responses import JSONResponse
 from app.core.exceptions import (
     AccountLockedError,
     DomainError,
+    PersistenceError,
+    PlanIntegrityError,
+    RunClaimError,
     ResourceNotFoundError,
     AuthenticationError,
     AuthorizationError,
@@ -41,6 +44,20 @@ async def domain_exception_handler(request: Request, exc: DomainError) -> JSONRe
     elif isinstance(exc, AuthorizationError):
         status_code = status.HTTP_403_FORBIDDEN
         code = "ACCESS_DENIED"
+    elif isinstance(exc, PlanIntegrityError):
+        # 409: the approved plan no longer matches what is stored. The caller has to
+        # re-plan and re-approve; retrying the same request cannot succeed.
+        status_code = status.HTTP_409_CONFLICT
+        code = "PLAN_INTEGRITY_VIOLATION"
+    elif isinstance(exc, RunClaimError):
+        # 409: another worker or request already owns this transition.
+        status_code = status.HTTP_409_CONFLICT
+        code = "RUN_ALREADY_CLAIMED"
+    elif isinstance(exc, PersistenceError):
+        # 500 deliberately: durable storage failed, which is our fault, not the
+        # caller's. The message is generic; the correlation id is the link to the log.
+        status_code = status.HTTP_500_INTERNAL_SERVER_ERROR
+        code = "PERSISTENCE_FAILURE"
     elif isinstance(exc, (ToolExecutionError, SandboxExecutionError)):
         status_code = status.HTTP_422_UNPROCESSABLE_ENTITY
         code = "EXECUTION_ERROR"
@@ -50,13 +67,24 @@ async def domain_exception_handler(request: Request, exc: DomainError) -> JSONRe
 
     logger.warning("Domain exception caught", code=code, detail=str(exc), correlation_id=correlation_id)
 
+    # A PersistenceError's message can carry driver detail - connection strings, table
+    # and column names - because it wraps a database exception. The full text is
+    # logged above with the correlation id; the client gets a generic message. Every
+    # other DomainError is authored by this codebase and is safe to return verbatim.
+    client_message = (
+        "A storage failure prevented this operation from completing. "
+        "The run was not started or has been marked failed; no partial state was kept."
+        if isinstance(exc, PersistenceError)
+        else str(exc)
+    )
+
     return JSONResponse(
         status_code=status_code,
         headers=headers or None,
         content={
             "error": {
                 "code": code,
-                "message": str(exc),
+                "message": client_message,
                 "correlation_id": correlation_id
             }
         }
